@@ -12,6 +12,7 @@ control agent — 交互式 TUI，查看并管理各 AI coding harness 的资源
     ↑/↓ 或 j/k   移动选择
     Enter / l    进入该 harness 的进程列表
     k            杀掉选中项（在列表里=整组，在进程里=单个）
+    t            切换详情页的会话面板（token 用量 / 标题 / 最近提问）
     s            切换排序：内存 / CPU / 名称
     r            立即刷新
     q / Esc      返回上一层 / 退出
@@ -31,6 +32,7 @@ control agent — 交互式 TUI，查看并管理各 AI coding harness 的资源
 """
 
 import curses
+import glob
 import json
 import os
 import re
@@ -108,6 +110,27 @@ SYSTEM_PREFIXES = ("/System/", "/usr/libexec/", "/usr/sbin/", "/sbin/", "/usr/li
 
 # 兜底排除：万一有系统服务落在非系统路径下
 SYSTEM_BASENAMES = {"CursorUIViewService", "AMPDeviceDiscoveryAgent", "AirDroid"}
+
+# ---------------------------------------------------------------- 会话数据源
+
+# Claude Code 把每个会话的完整记录按项目分目录存成 jsonl：
+#   ~/.claude/projects/<cwd 里的 / 换成 - >/<sessionId>.jsonl
+# 每条 assistant 记录带 message.usage（token 明细），ai-title 记录带会话标题。
+CLAUDE_DIR = os.path.expanduser("~/.claude")
+PROJECTS_DIR = os.path.join(CLAUDE_DIR, "projects")
+# 全局提问历史，每行 {display, timestamp, project, sessionId}。两用：
+# 既是「进程 → 会话」的对照表，也是「最近提问」的取数来源。
+HISTORY_FILE = os.path.join(CLAUDE_DIR, "history.jsonl")
+
+# 进程启动时间与「会话首次活动时间」的容差。实测四个在跑的 claude 进程偏差
+# 是 +14s / +4s / +73s / +23s，300s 留了足够余量。
+SESSION_MATCH_TOL = 300.0
+# history.jsonl 两次重读之间的最小间隔。用户正在用 Claude Code 时这个文件每条
+# prompt 都会变，一有改动就重读等于每次重扫都花 90ms 解析 5.8 万行。
+HISTORY_TTL = 30.0
+# 会话面板占几行，进程列表按它预留空间
+PANEL_H = 8
+PROMPT_ROWS = 3
 
 # ---------------------------------------------------------------- 进程采集
 
@@ -243,8 +266,11 @@ def sys_mem() -> dict:
 
 
 def fmt_bytes(n: int) -> str:
+    # 占位符用 ASCII 的 "-" 而不是 "—"：em dash 是 Ambiguous 宽度，而 dwidth() 按 1 列
+    # 算它，在把歧义字符渲染成 2 列的终端里会让右对齐的标题栏错位一个字符。
+    # 这条路径是够得着的：sys_mem() 取不到 compressor 时 mem.get('compressor', 0) == 0。
     if not n:
-        return "—"
+        return "-"
     for unit, div in (("G", 1 << 30), ("M", 1 << 20), ("K", 1 << 10)):
         if n >= div:
             return f"{n / div:.2f} {unit}B" if unit != "K" else f"{n / div:.0f} KB"
@@ -490,6 +516,250 @@ def confirm(stdscr, message: str) -> bool:
             return False
 
 
+def parse_etime(s: str) -> float:
+    """
+    ps 的 etime（已运行时长）换算成秒。三种格式：MM:SS、HH:MM:SS、D-HH:MM:SS。
+
+    为什么绕这一圈而不直接问 ps 要启动时间：
+      - macOS 的 ps **没有 etimes 关键字**（实测 `ps: etimes: keyword not found`），
+        拿不到「已运行秒数」这个现成字段；
+      - `ps -o lstart=` 能用，但它**受 locale 影响** —— 在 LC_ALL=zh_CN.UTF-8 下
+        输出的是「日  9月/20 18:13:35 2026」，strptime("%a %b %d %H:%M:%S %Y")
+        当场抛异常。强制 LC_ALL=C 可以绕开，但那是每个进程一次额外 subprocess。
+      - etime 是 locale 无关的纯数字格式，而且 read_procs() 本来就已经把它
+        存进 Proc.etime 了，所以这条路是零额外开销的。
+
+    实测：now - parse_etime(etime) 与 lstart 相差 +0.3s（那 0.3s 就是 ps 调用本身
+    的耗时），相对 SESSION_MATCH_TOL 的容差完全够用。
+    """
+    s = s.strip()
+    days = 0
+    if "-" in s:
+        head, _, s = s.partition("-")
+        try:
+            days = int(head)
+        except ValueError:
+            return 0.0
+    try:
+        parts = [int(x) for x in s.split(":")]
+    except ValueError:
+        return 0.0
+    while len(parts) < 3:
+        parts.insert(0, 0)
+    h, m, sec = parts[-3], parts[-2], parts[-1]
+    return float(days * 86400 + h * 3600 + m * 60 + sec)
+
+
+def proc_start_ts(p: "Proc") -> float:
+    """由 etime 反推进程的启动时刻（Unix 秒）。"""
+    return time.time() - parse_etime(p.etime)
+
+
+# history.jsonl 的索引缓存：(mtime, size, 上次读取时刻, 索引)
+_hist_cache: tuple[float, int, float, dict] | None = None
+
+
+def load_history(force: bool = False) -> dict:
+    """
+    读 ~/.claude/history.jsonl，返回 project -> {sid: [(ts_ms, display), ...]}，按时间升序。
+
+    这个文件同时解决两件事：进程对到哪个会话（用时间戳），以及「最近提问」显示什么
+    （用 display）。5.8 万行，解析一次约 90ms，所以必须缓存 —— 而且不能只按
+    mtime 判断：用户正在用 Claude Code 时每条 prompt 都会改这个文件，那样等于
+    每次重扫都重解析一遍。所以叠加一个 HISTORY_TTL 最小间隔。
+    """
+    global _hist_cache
+    try:
+        st = os.stat(HISTORY_FILE)
+        key = (st.st_mtime, st.st_size)
+    except OSError:
+        return {}
+
+    now = time.time()
+    if _hist_cache and not force:
+        mtime, size, read_at, idx = _hist_cache
+        if (mtime, size) == key or now - read_at < HISTORY_TTL:
+            return idx
+
+    idx: dict[str, dict[str, list]] = {}
+    try:
+        with open(HISTORY_FILE, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                # 快路径：这行没有 "project" 就不可能是我们要的记录，省掉 json.loads
+                if '"project"' not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                proj, sid = rec.get("project"), rec.get("sessionId")
+                ts = rec.get("timestamp")
+                if not (proj and sid and ts):
+                    continue
+                idx.setdefault(proj, {}).setdefault(sid, []).append((ts, rec.get("display", "")))
+    except OSError:
+        return _hist_cache[3] if _hist_cache else {}
+
+    for sessions in idx.values():
+        for entries in sessions.values():
+            entries.sort()
+
+    _hist_cache = (key[0], key[1], now, idx)
+    return idx
+
+
+def claude_session_file(sid: str) -> str:
+    """
+    按会话 id 找它的 jsonl 文件。
+
+    这里刻意**不复刻** Claude Code 那条「把 cwd 里的 / 换成 -」的目录命名规则，
+    而是直接 glob 会话 id：那条规则遇到路径里本来就有的 "-" 是有歧义的
+    （~/Downloads/new-api 会变成 -Users-pka-Downloads-new-api，和真实含 - 的
+    目录名撞车），而会话 id 全局唯一，绕开整个问题。
+    """
+    if not sid:
+        return ""
+    hits = glob.glob(os.path.join(PROJECTS_DIR, "*", sid + ".jsonl"))
+    return hits[0] if hits else ""
+
+
+def session_stats(sid: str) -> dict | None:
+    """
+    解析一个会话文件，汇总 token 用量、模型名、消息数与标题。实测 15-29ms（8MB 文件）。
+
+    token 字段在每条 assistant 记录的 message.usage 里；<synthetic> 是系统注入的
+    合成消息，实测它们四个 token 字段全是 0，直接跳过免得污染模型名的统计。
+    """
+    path = claude_session_file(sid)
+    if not path:
+        return None
+
+    tokens = {"input_tokens": 0, "output_tokens": 0,
+              "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
+    model_count: dict[str, int] = {}
+    msgs = 0
+    title = ""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if '"aiTitle"' in line:
+                    try:
+                        title = json.loads(line).get("aiTitle") or title
+                    except ValueError:
+                        pass
+                # 快路径：绝大多数记录（user / attachment / file-history-*）没有 usage，
+                # 先用子串筛掉，能省下大量 json.loads
+                if '"usage"' not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                msg = rec.get("message")
+                if not isinstance(msg, dict):
+                    continue
+                usage = msg.get("usage")
+                if not usage:
+                    continue
+                model = msg.get("model") or "?"
+                if model == "<synthetic>":
+                    continue
+                msgs += 1
+                model_count[model] = model_count.get(model, 0) + 1
+                for k in tokens:
+                    tokens[k] += usage.get(k, 0) or 0
+    except OSError:
+        return None
+
+    model = max(model_count, key=lambda k: model_count[k]) if model_count else "?"
+    return {"tokens": tokens, "model": model, "msgs": msgs, "title": title}
+
+
+def resolve_session(p: "Proc", cwd: str, hist: dict) -> tuple[str, str, float]:
+    """
+    把进程对到它正在跑的那个会话，返回 (sid, 确定性, 偏差秒数)。
+
+    判据是「进程启动时刻 ≈ 该会话在 history.jsonl 里的首次活动时刻」。
+
+    为什么不能用「这个目录下最近活动的会话」：实测 ~/Downloads/new-api 下同时跑着
+    两个 claude（pid 8124 和 18465），那个朴素启发式会把它们映射到同一个会话，
+    token 数直接翻倍。启动时间才是每个进程独有的。
+
+    两条实测出来的过滤规则，都不是想当然：
+      1. 只有斜杠命令的会话要排除。`/resume`、`/model` 这类命令不产生 assistant
+         轮次，于是落盘文件根本不存在，但它们在 history.jsonl 里是一条**独立的新
+         会话 id**。实测 pid 8124 是 `--resume` 启动的，它对应的那个 shell 会话
+         cba5b88e 只有一条 `/resume` 记录、偏差只有 +3s —— 不排掉的话它会以
+         「偏差最小」赢下比赛，而这个会话其实什么都不是。
+      2. 会话首次活动远晚于进程启动的，属于**更晚启动的那个进程**。pid 8124 启动于
+         10:17，而 04f50f8b 首次活动是 10:38:51（那是 pid 18465 的会话）—— 不排除
+         的话 8124 会去认领它。但这条只是「不可信」而非「不可能」（用户可能启动后
+         十分钟才打第一个字），所以降级到备选池而**不是**直接丢掉。
+
+    确定性只有两种，不装确定：
+      - 确认：偏差 <= SESSION_MATCH_TOL，且没有第二个候选也落在这个范围内；
+      - 推测：其余情况。`claude --resume` 复用的旧会话首次活动远早于进程启动，
+        必然落到这里 —— 这时面板会显示偏差秒数，让用户自己判断。
+    """
+    sessions = hist.get(cwd) or {}
+    if not sessions:
+        return "", "无会话", 0.0
+
+    start = proc_start_ts(p)
+    trusted, fallback = [], []
+    for sid, entries in sessions.items():
+        if not entries:
+            continue
+        first = entries[0][0] / 1000.0
+        last = entries[-1][0] / 1000.0
+        # 会话的最后活动早于进程启动，就不可能是它在跑
+        if last < start - SESSION_MATCH_TOL:
+            continue
+        # 整段历史只有斜杠命令 —— 命令回显，不是真的工作会话
+        if all(str(d).lstrip().startswith("/") for _, d in entries):
+            continue
+        delta = abs(first - start)
+        (trusted if first <= start + SESSION_MATCH_TOL else fallback).append((delta, sid))
+
+    pool = trusted or fallback
+    if not pool:
+        return "", "无会话", 0.0
+
+    pool.sort()
+    delta, sid = pool[0]
+    if trusted and delta <= SESSION_MATCH_TOL:
+        # 两个候选一样近 —— 同目录多会话并发，老实说不确定
+        if len(pool) > 1 and pool[1][0] <= SESSION_MATCH_TOL:
+            return sid, "推测", delta
+        return sid, "确认", delta
+    return sid, "推测", delta
+
+
+def session_panel(p: "Proc", cwd: str) -> dict:
+    """组装一个进程的会话面板数据。查不到就返回带说明的 dict，不留空。"""
+    if p.harness != "claude":
+        return {"note": "该 harness 暂时没有可解析的会话数据（目前只有 Claude Code 有）"}
+    if not cwd:
+        return {"note": "查不到工作目录，无法定位会话"}
+    if not os.path.isdir(PROJECTS_DIR):
+        return {"note": f"没有 {PROJECTS_DIR}，本机没跑过 Claude Code？"}
+
+    hist = load_history()
+    sid, conf, delta = resolve_session(p, cwd, hist)
+    if not sid:
+        return {"note": f"这个目录下没有找到匹配的会话（{cwd}）"}
+
+    stats = session_stats(sid)
+    if stats is None:
+        # 会话在 history 里存在但文件还没落盘：只有「刚提问、还没产生 assistant 轮次」
+        # 会这样。不要说成「刚启动」—— 实测有个跑了 8.7 小时的进程也走到过这里。
+        return {"note": f"会话 {sid[:8]} ({conf}) 还没有落盘内容，可能刚提问、模型还没回完",
+                "sid": sid, "conf": conf}
+
+    prompts = [d for _, d in (hist.get(cwd, {}).get(sid) or [])][-PROMPT_ROWS:]
+    return {"sid": sid, "conf": conf, "delta": delta, "prompts": prompts, **stats}
+
+
 def proc_cwd(pid: int) -> str:
     """
     进程的工作目录 —— 「这个 claude 在哪个项目里干活」唯一可靠的来源。
@@ -534,6 +804,62 @@ def draw_bar(stdscr, y: int, x: int, width: int, frac: float, pair: int) -> None
         pass
 
 
+def fmt_tokens(n: int) -> str:
+    """token 数带千分位。用 ASCII 逗号，理由同「结构性字符一律 ASCII」。"""
+    return f"{n:,}"
+
+
+def draw_session_panel(stdscr, y: int, w: int, info: dict, cwd: str) -> int:
+    """
+    画选中进程的会话面板（token 用量 + 标题 + 最近提问），返回下一行的 y。
+
+    只对「当前选中的那一个 pid」调用 —— 一次解析 15-30ms，每帧都算会明显卡顿。
+    """
+    def put(row: int, text: str, pair: int = 0) -> None:
+        try:
+            stdscr.addstr(row, 0, dtrunc(text, w - 1), attr(pair))
+        except curses.error:
+            pass
+
+    note = info.get("note")
+    if note:
+        put(y, f"  --- {note}", C_WARN)
+        return y + 1
+
+    sid = info.get("sid", "")
+    conf = info.get("conf", "")
+    delta = info.get("delta") or 0.0
+    tok = info.get("tokens") or {}
+
+    # 「推测」不装确定：--continue/--resume 会复用旧会话，判据本身就会失准
+    mark = f"{conf} 偏差{delta:+.0f}s" if conf == "推测" else conf
+    put(y, f"  --- 会话 {sid[:8]} ({mark})   模型 {info.get('model', '?')}"
+           f"   消息 {info.get('msgs', 0)} ---", C_TITLE)
+    y += 1
+    put(y, "  " + "输入 " + fmt_tokens(tok.get("input_tokens", 0))
+           + "   输出 " + fmt_tokens(tok.get("output_tokens", 0))
+           + "   缓存读 " + fmt_tokens(tok.get("cache_read_input_tokens", 0))
+           + "   缓存写 " + fmt_tokens(tok.get("cache_creation_input_tokens", 0)))
+    y += 1
+    put(y, "  合计 " + fmt_tokens(sum(tok.values())) + " tokens"
+           + (f"     目录 {cwd}" if cwd else ""), C_DIM)
+    y += 1
+
+    if info.get("title"):
+        put(y, f"  标题 {info['title']}")
+        y += 1
+    prompts = info.get("prompts") or []
+    if prompts:
+        put(y, "  最近提问", C_DIM)
+        y += 1
+        for entry in prompts:
+            # display 可能是多行的（用户粘贴过换行），只取第一行非空内容
+            text = next((ln.strip() for ln in str(entry).splitlines() if ln.strip()), "")
+            put(y, f"    {text}")
+            y += 1
+    return y
+
+
 def tui(stdscr, interval: float) -> None:
     curses.curs_set(0)
     init_colors()
@@ -543,25 +869,48 @@ def tui(stdscr, interval: float) -> None:
     procs: list[Proc] = []
     sort_mode = 0
     sel = 0
+    sel_key: str | None = None       # 主列表选中的 harness key（锚点，见渲染处说明）
     detail_of: str | None = None    # 非 None 表示在某个 harness 的进程列表里
     dsel = 0
+    dsel_pid: int | None = None      # 详情页选中的 pid（同样是锚点）
     status = ""
     status_until = 0.0
     last_scan = 0.0
     cwd_cache: dict[int, str] = {}   # pid → 工作目录，进入详情时查一次
+    sess_cache: dict[int, dict] = {}  # pid → 会话面板数据，同样是按需算一次
+    show_panel = True                 # t 键切换
+    dtop = 0                          # 详情列表的滚动偏移
+    # 渲染时算好的列表，供按键处理里把「锚点」同步到新选中项 —— 见下方 ↓/↑ 的说明
+    dgroups: list = []
+    dplist: list = []
 
     while True:
         now = time.time()
+        # 只在「重新采集过」的那一帧做选择锚定。若每帧都锚，用户按 ↓ 改掉的 dsel
+        # 会被立刻按旧 pid 算回去，选择直接冻住（实测连按 6 次 ↓ 纹丝不动）。
+        rescanned = False
         if now - last_scan > interval or not procs:
             procs = scan()
             last_scan = now
-            # 清掉已经消失的 pid：不然 pid 被回收后会把旧的目录显示给新进程
+            rescanned = True
+            # 清掉已经消失的 pid：不然 pid 被回收后会把旧的目录/会话显示给新进程
             live = {p.pid for p in procs}
             for gone in [k for k in cwd_cache if k not in live]:
                 del cwd_cache[gone]
+            for gone in [k for k in sess_cache if k not in live]:
+                del sess_cache[gone]
 
         groups = sort_groups(group_procs(procs), SORTS[sort_mode][0])
+        # 选择必须锚在「哪一个」上，而不是行号上。
+        # 列表按内存排序，而内存每帧都在变，行号会自己漂 —— 实测抓屏时两个 ↓ 之间
+        # 顺序就变了一次，结果选中项不是用户以为的那一行。这不只是面板显示错乱：
+        # k 是按 plist[dsel] 杀的，漂移会杀掉错的进程。
+        if rescanned and sel_key is not None:
+            sel = next((i for i, g in enumerate(groups) if g.harness.key == sel_key), sel)
         sel = max(0, min(sel, len(groups) - 1))
+        if groups:
+            sel_key = groups[sel].harness.key
+        dgroups = groups
 
         stdscr.erase()
         h, w = stdscr.getmaxyx()
@@ -643,10 +992,24 @@ def tui(stdscr, interval: float) -> None:
             except curses.error:
                 pass
             plist = sorted(g.procs, key=lambda p: -p.rss_kb) if g else []
+            # 同主列表：锚 pid 而不是行号，否则内存一波动选中项就换人了。
+            # 同样只在重采过的那一帧锚，否则 ↓ 会被立刻抵消。
+            if rescanned and dsel_pid is not None:
+                dsel = next((i for i, p in enumerate(plist) if p.pid == dsel_pid), dsel)
             dsel = max(0, min(dsel, len(plist) - 1))
-            for i, p in enumerate(plist):
-                if y >= h - 3:
-                    break
+            if plist:
+                dsel_pid = plist[dsel].pid
+            dplist = plist
+            # 面板要占地方，列表得先给它让出 PANEL_H 行，否则行数一多面板就被挤出屏幕
+            rows_h = h - 3 - (PANEL_H if show_panel else 0)
+            # 滚动：保证选中行可见（面板吃掉几行后，选中行滚出屏幕的可能性变大了）
+            if dsel < dtop:
+                dtop = dsel
+            elif rows_h > 0 and dsel >= dtop + rows_h:
+                dtop = dsel - rows_h + 1
+            dtop = max(0, min(dtop, max(0, len(plist) - rows_h)))
+            for i, p in enumerate(plist[dtop:dtop + max(0, rows_h)]):
+                i += dtop
                 # 用 [保护] 而不是 emoji：emoji 显示宽度不定，且不是所有终端都能渲染
                 # 显示工作目录而不是 comm：claude 的 comm 只是个裸名 "claude"，
                 # 目录才能说明这个进程在哪个项目里干活
@@ -660,6 +1023,17 @@ def tui(stdscr, interval: float) -> None:
                     pass
                 y += 1
 
+            if show_panel and plist and y < h - 3:
+                sp = plist[dsel]
+                # 必须写成 if，不能用 dict.setdefault —— setdefault 的第二个参数
+                # 总会被求值，那等于每帧都跑一次 15-30ms 的会话解析。
+                if sp.pid not in sess_cache:
+                    cwd = cwd_cache.get(sp.pid) or proc_cwd(sp.pid)
+                    cwd_cache[sp.pid] = cwd
+                    sess_cache[sp.pid] = session_panel(sp, cwd)
+                y = draw_session_panel(stdscr, y, w, sess_cache[sp.pid],
+                                       cwd_cache.get(sp.pid, ""))
+
         # ---- 状态栏
         if status and time.time() < status_until:
             try:
@@ -671,7 +1045,8 @@ def tui(stdscr, interval: float) -> None:
                 keys = (f"  方向键 选择   Enter 明细   k 杀掉选中   "
                         f"s 排序({SORTS[sort_mode][1]})   r 刷新   q 退出")
             else:
-                keys = "  方向键 选择   k 杀掉选中进程   Esc/q 返回"
+                keys = (f"  方向键 选择   k 杀掉选中进程   t 会话面板"
+                        f"({'开' if show_panel else '关'})   Esc/q 返回")
             stdscr.addstr(h - 1, 0, dtrunc(keys, w - 1), attr(C_TITLE))
         except curses.error:
             pass
@@ -687,6 +1062,7 @@ def tui(stdscr, interval: float) -> None:
         if ch in (ord("q"), 27, curses.KEY_LEFT):
             if detail_of is not None:
                 detail_of = None
+                dsel_pid = None
             else:
                 return
             continue
@@ -702,13 +1078,31 @@ def tui(stdscr, interval: float) -> None:
                 sel += 1
             else:
                 dsel += 1
+        if ch in (curses.KEY_UP, curses.KEY_DOWN):
+            # 把锚点同步到「刚选中的那一项」。不同步的话，下一帧若恰好碰上重采，
+            # 锚定会按**移动前**的 pid 把行号算回去，这一次按键就被吃掉了 ——
+            # 2 秒刷新间隔下约等于每两次按 ↓ 丢一次。
+            if detail_of is None:
+                sel = max(0, min(sel, len(dgroups) - 1))
+                if dgroups:
+                    sel_key = dgroups[sel].harness.key
+            else:
+                dsel = max(0, min(dsel, len(dplist) - 1))
+                if dplist:
+                    dsel_pid = dplist[dsel].pid
         elif ch == ord("s"):
             sort_mode = (sort_mode + 1) % len(SORTS)
             status = f"排序：{SORTS[sort_mode][1]}"
             status_until = time.time() + 1.5
+        elif ch == ord("t"):
+            show_panel = not show_panel
+            status = f"会话面板：{'开' if show_panel else '关'}"
+            status_until = time.time() + 1.5
         elif ch == ord("r"):
             procs = scan()
             last_scan = time.time()
+            # 会话是活的：手动刷新时一并丢掉面板缓存，否则 token 数会一直停在旧值
+            sess_cache.clear()
             status = "已刷新"
             status_until = time.time() + 1.0
         elif ch in (10, 13, curses.KEY_RIGHT, ord("l")):
@@ -716,6 +1110,8 @@ def tui(stdscr, interval: float) -> None:
                 if groups[sel].procs:
                     detail_of = groups[sel].harness.key
                     dsel = 0
+                    dsel_pid = None
+                    dtop = 0
                     # 在这里一次查完，而不是渲染时按需查：每帧几十毫秒会明显卡
                     for p in groups[sel].procs[:CWD_LOOKUP_MAX]:
                         cwd_cache.setdefault(p.pid, proc_cwd(p.pid))
@@ -759,6 +1155,7 @@ def tui(stdscr, interval: float) -> None:
                         status_until = time.time() + 4
                         if not gone:
                             detail_of = None
+                            dsel_pid = None
                     else:
                         status, status_until = "已取消", time.time() + 1.5
 
