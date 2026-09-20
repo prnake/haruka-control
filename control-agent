@@ -371,9 +371,9 @@ def print_table(procs: list[Proc]) -> None:
     groups = sort_groups(group_procs(procs), "mem")
     mem = sys_mem()
     if mem["total"]:
-        print(f"内存 {fmt_bytes(mem['total'])} · 已用 {fmt_bytes(mem['used'])}"
-              f" · 压缩 {fmt_bytes(mem.get('compressor', 0))}"
-              f" · 空闲 {fmt_bytes(mem.get('free', 0))}")
+        print(f"内存 {fmt_bytes(mem['total'])} | 已用 {fmt_bytes(mem['used'])}"
+              f" | 压缩 {fmt_bytes(mem.get('compressor', 0))}"
+              f" | 空闲 {fmt_bytes(mem.get('free', 0))}")
     print("  " + dpad("HARNESS", 16) + dpad("进程", 5, True) + dpad("内存", 11, True)
           + dpad("CPU", 8, True) + "   状态")
     print("-" * 62)
@@ -393,8 +393,8 @@ def print_table(procs: list[Proc]) -> None:
             print("  " + dpad(g.harness.label, 16) + dpad(str(n), 5, True)
                   + dpad(fmt_mb(kb), 11, True) + dpad(f"{g.cpu:.1f}%", 8, True) + "   " + flag)
         else:
-            print("  " + dpad(g.harness.label, 16) + dpad("—", 5, True)
-                  + dpad("—", 11, True) + dpad("—", 8, True) + "   未运行")
+            print("  " + dpad(g.harness.label, 16) + dpad("-", 5, True)
+                  + dpad("-", 11, True) + dpad("-", 8, True) + "   未运行")
     print("-" * 62)
     print("  " + dpad("合计", 16) + dpad(str(total_n), 5, True) + dpad(fmt_mb(total_kb), 11, True))
 
@@ -490,11 +490,46 @@ def confirm(stdscr, message: str) -> bool:
             return False
 
 
+def proc_cwd(pid: int) -> str:
+    """
+    进程的工作目录 —— 「这个 claude 在哪个项目里干活」唯一可靠的来源。
+
+    为什么不能用别的：
+      - 内存数字（RSS）完全说明不了问题，它只是个数字；
+      - comm 经常只给裸名。macOS 拿不到完整可执行路径时会退回 p_comm 那个
+        16 字节字段，实测四个 claude 进程的 comm 全都是 "claude"，
+        所以路径匹配实际上没生效，是 names=("claude",) 的兜底在起作用。
+      - lsof 单次约 30ms，比 ps 慢一个数量级，所以只在进入详情视图时查一次
+        并缓存，绝不能每帧都跑。
+    """
+    try:
+        out = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                             capture_output=True, text=True, timeout=3).stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+    for line in out.splitlines():
+        if line.startswith("n"):
+            return line[1:].strip()
+    return ""
+
+
+# 进入详情视图时最多查多少个进程的 cwd：每个约 30ms，一次查太多会明显卡顿
+CWD_LOOKUP_MAX = 12
+
+
 def draw_bar(stdscr, y: int, x: int, width: int, frac: float, pair: int) -> None:
+    """
+    进度条只用 ASCII。
+
+    踩过的坑：这里原本用的是 █ (U+2588) 和 ░ (U+2591)。它们的 East Asian Width
+    都是 Ambiguous —— 在把「歧义字符按两列渲染」的终端里（CJK 字体设置常见），
+    每个 █ 实际占 2 列，而本文件按 1 列算，24 个 █ 会撑成 48 列，把右边的文字
+    全部盖掉，看起来就是一片乱码。ASCII 的宽度在任何终端里都没有歧义。
+    """
     filled = max(0, min(width, int(width * frac)))
     try:
-        stdscr.addstr(y, x, "█" * filled, attr(pair))
-        stdscr.addstr(y, x + filled, "░" * (width - filled), attr(C_DIM))
+        stdscr.addstr(y, x, "#" * filled, attr(pair))
+        stdscr.addstr(y, x + filled, "-" * (width - filled), attr(C_DIM))
     except curses.error:
         pass
 
@@ -513,12 +548,17 @@ def tui(stdscr, interval: float) -> None:
     status = ""
     status_until = 0.0
     last_scan = 0.0
+    cwd_cache: dict[int, str] = {}   # pid → 工作目录，进入详情时查一次
 
     while True:
         now = time.time()
         if now - last_scan > interval or not procs:
             procs = scan()
             last_scan = now
+            # 清掉已经消失的 pid：不然 pid 被回收后会把旧的目录显示给新进程
+            live = {p.pid for p in procs}
+            for gone in [k for k in cwd_cache if k not in live]:
+                del cwd_cache[gone]
 
         groups = sort_groups(group_procs(procs), SORTS[sort_mode][0])
         sel = max(0, min(sel, len(groups) - 1))
@@ -531,13 +571,13 @@ def tui(stdscr, interval: float) -> None:
         title = f" control agent "
         try:
             stdscr.addstr(0, 0, title, attr(C_TITLE, curses.A_BOLD))
-            right = (f"内存 {fmt_bytes(mem['total'])} · 已用 {fmt_bytes(mem['used'])}"
-                     f" · 压缩 {fmt_bytes(mem.get('compressor', 0))} ")
+            right = (f"内存 {fmt_bytes(mem['total'])} | 已用 {fmt_bytes(mem['used'])}"
+                     f" | 压缩 {fmt_bytes(mem.get('compressor', 0))} ")
             rw, tw = dwidth(right), dwidth(title)
             if rw < w - tw - 2:
                 stdscr.addstr(0, w - rw - 1, right, attr(C_DIM))
             # 只画到 w-1：写到最后一个单元格会让 curses 抛错
-            stdscr.addstr(1, 0, "─" * max(0, w - 1), attr(C_DIM))
+            stdscr.addstr(1, 0, "-" * max(0, w - 1), attr(C_DIM))
         except curses.error:
             pass
 
@@ -548,7 +588,7 @@ def tui(stdscr, interval: float) -> None:
                    + dpad("内存", 11, True) + dpad("CPU", 8, True) + "   占用分布")
             try:
                 stdscr.addstr(y, 0, dtrunc(hdr, w - 1), attr(C_DIM)); y += 1
-                stdscr.addstr(y, 0, "  " + "─" * max(0, w - 5), attr(C_DIM)); y += 1
+                stdscr.addstr(y, 0, "  " + "-" * max(0, w - 5), attr(C_DIM)); y += 1
             except curses.error:
                 pass
 
@@ -568,10 +608,10 @@ def tui(stdscr, interval: float) -> None:
                     else:
                         tail = ""
                 else:
-                    mems = cpus = "—"
+                    mems = cpus = "-"
                     tail = "未运行"
                 line = ("  " + dpad(g.harness.label, 16)
-                        + dpad(str(n) if n else "—", 5, True)
+                        + dpad(str(n) if n else "-", 5, True)
                         + dpad(mems, 11, True) + dpad(cpus, 8, True) + "   ")
                 lw = dwidth(line)
                 selected = (i == sel)
@@ -591,12 +631,15 @@ def tui(stdscr, interval: float) -> None:
             # ---- 进程明细视图
             g = next((x for x in groups if x.harness.key == detail_of), None)
             try:
-                dtitle = f"  ▸ {g.harness.label} 的进程（{len(g.procs)}）" if g else ""
+                dtitle = f"  > {g.harness.label} 的进程（{len(g.procs)}）" if g else ""
+                # 表头列必须和数据行逐列对齐：数据行有 [保护] 这一列，表头漏掉的话
+                # 「路径」会压在 [保护] 上方，看着像排版坏了。
                 dhdr = ("  " + dpad("PID", 7, True) + dpad("内存", 11, True)
-                        + dpad("CPU", 8, True) + "  运行时长     路径")
+                        + dpad("CPU", 8, True) + "  "
+                        + dpad("运行时长", 11) + dpad("保护", 7) + "工作目录")
                 stdscr.addstr(y, 0, dtrunc(dtitle, w - 1), attr(C_TITLE)); y += 1
                 stdscr.addstr(y, 0, dtrunc(dhdr, w - 1), attr(C_DIM)); y += 1
-                stdscr.addstr(y, 0, "  " + "─" * max(0, w - 5), attr(C_DIM)); y += 1
+                stdscr.addstr(y, 0, "  " + "-" * max(0, w - 5), attr(C_DIM)); y += 1
             except curses.error:
                 pass
             plist = sorted(g.procs, key=lambda p: -p.rss_kb) if g else []
@@ -605,10 +648,12 @@ def tui(stdscr, interval: float) -> None:
                 if y >= h - 3:
                     break
                 # 用 [保护] 而不是 emoji：emoji 显示宽度不定，且不是所有终端都能渲染
+                # 显示工作目录而不是 comm：claude 的 comm 只是个裸名 "claude"，
+                # 目录才能说明这个进程在哪个项目里干活
                 line = ("  " + dpad(str(p.pid), 7, True) + dpad(fmt_mb(p.rss_kb), 11, True)
                         + dpad(f"{p.cpu:.1f}%", 8, True) + "  "
                         + dpad(p.etime, 11) + dpad("[保护]" if p.protected else "", 7)
-                        + p.comm)
+                        + (cwd_cache.get(p.pid) or p.comm))
                 try:
                     stdscr.addstr(y, 0, dtrunc(line, w - 1), attr(C_SEL) if i == dsel else 0)
                 except curses.error:
@@ -623,10 +668,10 @@ def tui(stdscr, interval: float) -> None:
                 pass
         try:
             if detail_of is None:
-                keys = (f"  ↑↓ 选择   Enter 明细   k 杀掉选中   "
+                keys = (f"  方向键 选择   Enter 明细   k 杀掉选中   "
                         f"s 排序({SORTS[sort_mode][1]})   r 刷新   q 退出")
             else:
-                keys = "  ↑↓ 选择   k 杀掉选中进程   ←/Esc/q 返回"
+                keys = "  方向键 选择   k 杀掉选中进程   Esc/q 返回"
             stdscr.addstr(h - 1, 0, dtrunc(keys, w - 1), attr(C_TITLE))
         except curses.error:
             pass
@@ -671,6 +716,9 @@ def tui(stdscr, interval: float) -> None:
                 if groups[sel].procs:
                     detail_of = groups[sel].harness.key
                     dsel = 0
+                    # 在这里一次查完，而不是渲染时按需查：每帧几十毫秒会明显卡
+                    for p in groups[sel].procs[:CWD_LOOKUP_MAX]:
+                        cwd_cache.setdefault(p.pid, proc_cwd(p.pid))
         elif ch == ord("k"):
             if detail_of is None:
                 g = groups[sel]
