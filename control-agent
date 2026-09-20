@@ -1,0 +1,748 @@
+#!/usr/bin/env python3
+"""
+control agent — 交互式 TUI，查看并管理各 AI coding harness 的资源占用。
+
+用法:
+    control agent              打开 TUI
+    control agent --once       打印一次表格后退出（非交互，可管道）
+    control agent --json       输出 JSON
+    control agent --list       列出识别到的 harness 及其匹配规则
+
+键位（TUI）:
+    ↑/↓ 或 j/k   移动选择
+    Enter / l    进入该 harness 的进程列表
+    k            杀掉选中项（在列表里=整组，在进程里=单个）
+    s            切换排序：内存 / CPU / 名称
+    r            立即刷新
+    q / Esc      返回上一层 / 退出
+
+匹配策略（重要）:
+    macOS 上按名字做子串匹配会误伤 —— 例如 CursorUIViewService.xpc（系统文字
+    输入服务）和 AMPDeviceDiscoveryAgent（系统设备发现）都不是 harness。
+    因此这里按三步走：
+      1. 硬排除系统路径（/System/、/usr/libexec/ 等），一次性解决上述误伤；
+      2. 路径子串匹配（模式必须含 "/"，避免匹配到任意参数里的裸词）；
+      3. basename 精确匹配（仅用于没有系统同名冲突的名字，如 claude）。
+    对 cursor / amp 这类有系统同名服务的，只走第 2 步，绝不按裸名匹配。
+
+    另外 node/bun 类 CLI（codex、opencode 等）在 ps 里可能只显示 node，身份藏在
+    参数里，所以额外做了 argv 匹配（模式同样要求含 "/"）。若有 harness 没被识别到，
+    用 control agent --list 看匹配规则再补进 HARNESSES。
+"""
+
+import curses
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+import unicodedata
+from dataclasses import dataclass, field
+
+# ---------------------------------------------------------------- harness 注册表
+
+
+@dataclass(frozen=True)
+class Harness:
+    key: str                      # 内部标识
+    label: str                    # 显示名
+    paths: tuple = ()             # comm 里的路径子串，必须含 "/"
+    names: tuple = ()             # basename 精确匹配（小写）
+    argv: tuple = ()              # 完整命令行的子串，必须含 "/"
+
+
+HARNESSES = [
+    Harness("claude", "Claude Code",
+            paths=("/.local/share/claude/", "/.claude/"),
+            names=("claude",),
+            argv=("/@anthropic-ai/claude", "/.local/share/claude/")),
+    Harness("codex", "Codex",
+            paths=("/.codex/", "/bin/codex", "/Codex.app/"),
+            names=("codex",),
+            argv=("/@openai/codex", "/.codex/", "/bin/codex")),
+    Harness("codexbar", "CodexBar",
+            paths=("/CodexBar.app/",),
+            names=()),
+    Harness("cursor", "Cursor",
+            # 只按路径匹配：裸名 "cursor" 会撞上系统的 CursorUIViewService
+            paths=("/Cursor.app/", "/.cursor/"),
+            names=()),
+    Harness("windsurf", "Windsurf",
+            paths=("/Windsurf.app/", "/.codeium/", "/.windsurf/"),
+            names=()),
+    Harness("zcode", "ZCode",
+            paths=("/ZCode.app/",),
+            names=()),
+    Harness("zed", "Zed",
+            paths=("/Zed.app/",),
+            names=()),
+    Harness("warp", "Warp",
+            paths=("/Warp.app/",),
+            names=()),
+    Harness("opencode", "opencode",
+            paths=("/.opencode/",),
+            names=("opencode",),
+            argv=("/opencode-ai/", "/.opencode/")),
+    Harness("amp", "amp",
+            # 只按路径匹配：裸名 "amp" 会撞上系统的 AMPDeviceDiscoveryAgent
+            paths=("/.amp/",),
+            names=()),
+    Harness("kimi", "Kimi",
+            paths=("/.kimi-code/", "/.kimi-webbridge/"),
+            names=("kimi", "kimi-webbridge")),
+    Harness("droid", "Droid (Factory)",
+            paths=("/.factory/",),
+            names=("droid",)),
+    Harness("harbor", "Harbor",
+            paths=("/uv/tools/harbor/",),
+            names=("harbor",)),
+    Harness("agent-reach", "agent-reach",
+            paths=("/pipx/venvs/agent-reach/",),
+            names=("agent-reach",)),
+]
+
+# 硬排除：这些前缀下的进程永远不是 harness
+SYSTEM_PREFIXES = ("/System/", "/usr/libexec/", "/usr/sbin/", "/sbin/", "/usr/lib/")
+
+# 兜底排除：万一有系统服务落在非系统路径下
+SYSTEM_BASENAMES = {"CursorUIViewService", "AMPDeviceDiscoveryAgent", "AirDroid"}
+
+# ---------------------------------------------------------------- 进程采集
+
+
+@dataclass
+class Proc:
+    pid: int
+    ppid: int
+    rss_kb: int
+    cpu: float
+    etime: str
+    comm: str
+    argv: str
+    harness: str | None = None
+    protected: bool = False   # 当前会话的祖先链，杀了会把自己弄死
+
+
+def read_procs() -> list[Proc]:
+    """
+    分两次 ps 调用再按 pid 合并。
+
+    踩过的坑：一旦在同一个 ps 里同时请求 comm 和 command，macOS 会把 comm 截断到
+    16 字符 —— /Users/pka/.kimi-webbridge/bin/kimi-webbridge 变成 /Users/pka/.kimi，
+    所有路径匹配就全废了。单独取 comm 才完整，因此这里分两次拿。
+    """
+    def run(args: list[str]) -> str:
+        try:
+            return subprocess.run(args, capture_output=True, text=True, timeout=10).stdout
+        except (subprocess.TimeoutExpired, OSError):
+            return ""
+
+    comm_by_pid: dict[int, str] = {}
+    for line in run(["ps", "-Ao", "pid=,comm="]).splitlines():
+        head, _, tail = line.strip().partition(" ")
+        if head.isdigit() and tail.strip():
+            comm_by_pid[int(head)] = tail.strip()
+
+    procs = []
+    for line in run(["ps", "-Ao", "pid=,ppid=,rss=,pcpu=,etime=,command="]).splitlines():
+        parts = line.split(None, 5)          # command 可能含空格，限制切分次数
+        if len(parts) < 6:
+            continue
+        pid_s, ppid_s, rss_s, cpu_s, etime, argv = parts
+        try:
+            pid, ppid, rss = int(pid_s), int(ppid_s), int(rss_s)
+        except ValueError:
+            continue
+        if pid <= 1:
+            continue
+        procs.append(Proc(pid, ppid, rss, float(cpu_s or 0), etime,
+                          comm_by_pid.get(pid, argv), argv))
+    return procs
+
+
+def ancestor_chain(procs: list[Proc]) -> set[int]:
+    """
+    当前进程往上到 launchd 的整条祖先链。
+
+    多半是从 claude 会话里跑这个 TUI 的 —— 如果杀掉 claude 整组却把自己的会话
+    也算进去，TUI 会当场把自己弄死，所以这些 pid 必须标记为受保护。
+    """
+    ppid_of = {p.pid: p.ppid for p in procs}
+    chain, pid = {os.getpid()}, os.getpid()
+    for _ in range(64):
+        nxt = ppid_of.get(pid)
+        if not nxt or nxt <= 1 or nxt in chain:
+            break
+        chain.add(nxt)
+        pid = nxt
+    return chain
+
+
+def classify(p: Proc) -> str | None:
+    comm, argv = p.comm, p.argv
+    if comm.startswith(SYSTEM_PREFIXES):
+        return None
+    if os.path.basename(comm) in SYSTEM_BASENAMES:
+        return None
+    base = os.path.basename(comm).lower()
+    for h in HARNESSES:
+        for pat in h.paths:
+            if pat in comm:
+                return h.key
+        if base in h.names:
+            return h.key
+    for h in HARNESSES:
+        for pat in h.argv:
+            if pat in argv:
+                return h.key
+    return None
+
+
+def scan() -> list[Proc]:
+    procs = read_procs()
+    prot = ancestor_chain(procs)
+    for p in procs:
+        p.harness = classify(p)
+        p.protected = p.pid in prot
+    return [p for p in procs if p.harness]
+
+
+# ---------------------------------------------------------------- 系统内存
+
+
+def sys_mem() -> dict:
+    """总内存 + vm_stat 关键页数。压缩器占用是 16G 机器上最关键的信号。"""
+    total = 0
+    try:
+        total = int(subprocess.run(["sysctl", "-n", "hw.memsize"],
+                                   capture_output=True, text=True, timeout=5).stdout.strip())
+    except (ValueError, OSError, subprocess.TimeoutExpired):
+        pass
+    page = os.sysconf("SC_PAGE_SIZE")
+    want = {
+        "Pages free": "free",
+        "Pages active": "active",
+        "Pages wired down": "wired",
+        "Pages occupied by compressor": "compressor",
+    }
+    stats = {}
+    try:
+        vm = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
+        for line in vm.splitlines():
+            for k, v in want.items():
+                if line.startswith(k):
+                    m = re.search(r":\s*(\d+)", line)
+                    if m:
+                        stats[v] = int(m.group(1)) * page
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    used = stats.get("active", 0) + stats.get("wired", 0) + stats.get("compressor", 0)
+    return {"total": total, "used": used, **stats}
+
+
+def fmt_bytes(n: int) -> str:
+    if not n:
+        return "—"
+    for unit, div in (("G", 1 << 30), ("M", 1 << 20), ("K", 1 << 10)):
+        if n >= div:
+            return f"{n / div:.2f} {unit}B" if unit != "K" else f"{n / div:.0f} KB"
+    return f"{n} B"
+
+
+def fmt_mb(kb: int) -> str:
+    return fmt_bytes(kb * 1024)
+
+
+def dwidth(s: str) -> int:
+    """终端显示宽度。CJK 全角字符占 2 列 —— 用 len() 会让含中文的表格整体错位。"""
+    return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in s)
+
+
+def dpad(s: str, width: int, right: bool = False) -> str:
+    pad = " " * max(0, width - dwidth(s))
+    return pad + s if right else s + pad
+
+
+def dtrunc(s: str, width: int) -> str:
+    """按显示宽度截断，避免写到行尾触发 curses.error。"""
+    out, acc = [], 0
+    for c in s:
+        cw = 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+        if acc + cw > width:
+            break
+        out.append(c)
+        acc += cw
+    return "".join(out)
+
+
+# ---------------------------------------------------------------- 分组
+
+
+@dataclass
+class Group:
+    harness: Harness
+    procs: list[Proc] = field(default_factory=list)
+
+    @property
+    def rss_kb(self) -> int:
+        return sum(p.rss_kb for p in self.procs)
+
+    @property
+    def cpu(self) -> float:
+        return sum(p.cpu for p in self.procs)
+
+    @property
+    def protected_count(self) -> int:
+        return sum(1 for p in self.procs if p.protected)
+
+    @property
+    def protected_only(self) -> bool:
+        return bool(self.procs) and self.protected_count == len(self.procs)
+
+
+def group_procs(procs: list[Proc]) -> list[Group]:
+    groups = {h.key: Group(h) for h in HARNESSES}
+    for p in procs:
+        groups[p.harness].procs.append(p)
+    return list(groups.values())
+
+
+SORTS = [("mem", "内存"), ("cpu", "CPU"), ("name", "名称")]
+SORT_KEYS = {"mem": lambda g: -g.rss_kb,
+             "cpu": lambda g: -g.cpu,
+             "name": lambda g: g.harness.label.lower()}
+
+
+def sort_groups(groups: list[Group], mode: str) -> list[Group]:
+    # 未运行的沉底，运行的按选定维度排
+    return sorted(groups, key=lambda g: (not g.procs, SORT_KEYS[mode](g)))
+
+
+# ---------------------------------------------------------------- 杀进程
+
+
+def kill_pids(pids: list[int], grace: float = 2.0) -> tuple[list[int], list[str]]:
+    """SIGTERM → 宽限期 → 对残留的补 SIGKILL。返回 (已退出, 失败原因)。"""
+    errors = []
+    alive = []
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            errors.append(f"pid {pid}: 权限不足（属于其他用户，需要 sudo）")
+        else:
+            alive.append(pid)
+
+    deadline = time.time() + grace
+    while alive and time.time() < deadline:
+        time.sleep(0.1)
+        alive = [p for p in alive if _alive(p)]
+
+    for pid in list(alive):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError) as e:
+            errors.append(f"pid {pid}: SIGKILL 失败 ({e.__class__.__name__})")
+
+    time.sleep(0.2)
+    remaining = [p for p in pids if _alive(p)]
+    gone = [p for p in pids if p not in remaining]
+    return gone, errors
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+# ---------------------------------------------------------------- 非交互输出
+
+
+def print_table(procs: list[Proc]) -> None:
+    groups = sort_groups(group_procs(procs), "mem")
+    mem = sys_mem()
+    if mem["total"]:
+        print(f"内存 {fmt_bytes(mem['total'])} · 已用 {fmt_bytes(mem['used'])}"
+              f" · 压缩 {fmt_bytes(mem.get('compressor', 0))}"
+              f" · 空闲 {fmt_bytes(mem.get('free', 0))}")
+    print("  " + dpad("HARNESS", 16) + dpad("进程", 5, True) + dpad("内存", 11, True)
+          + dpad("CPU", 8, True) + "   状态")
+    print("-" * 62)
+    total_n = total_kb = 0
+    for g in groups:
+        n, kb = len(g.procs), g.rss_kb
+        total_n += n
+        total_kb += kb
+        if n:
+            np_ = g.protected_count
+            if np_ == n:
+                flag = "全部受保护（当前会话）"
+            elif np_:
+                flag = f"运行中（{np_} 个受保护）"
+            else:
+                flag = "运行中"
+            print("  " + dpad(g.harness.label, 16) + dpad(str(n), 5, True)
+                  + dpad(fmt_mb(kb), 11, True) + dpad(f"{g.cpu:.1f}%", 8, True) + "   " + flag)
+        else:
+            print("  " + dpad(g.harness.label, 16) + dpad("—", 5, True)
+                  + dpad("—", 11, True) + dpad("—", 8, True) + "   未运行")
+    print("-" * 62)
+    print("  " + dpad("合计", 16) + dpad(str(total_n), 5, True) + dpad(fmt_mb(total_kb), 11, True))
+
+
+def print_json(procs: list[Proc]) -> None:
+    groups = sort_groups(group_procs(procs), "mem")
+    mem = sys_mem()
+    out = {
+        "system_memory": mem,
+        "harnesses": [
+            {
+                "key": g.harness.key,
+                "label": g.harness.label,
+                "count": len(g.procs),
+                "rss_bytes": g.rss_kb * 1024,
+                "cpu_percent": round(g.cpu, 1),
+                "protected_only": g.protected_only,
+                "processes": [
+                    {"pid": p.pid, "rss_bytes": p.rss_kb * 1024, "cpu": p.cpu,
+                     "etime": p.etime, "protected": p.protected, "comm": p.comm}
+                    for p in sorted(g.procs, key=lambda p: -p.rss_kb)
+                ],
+            }
+            for g in groups
+        ],
+    }
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+
+
+def print_list() -> None:
+    print("识别到的 harness 及匹配规则：\n")
+    for h in HARNESSES:
+        print(f"  {h.key:<12} {h.label}")
+        if h.paths:
+            print(f"      路径: {'  '.join(h.paths)}")
+        if h.names:
+            print(f"      名字: {'  '.join(h.names)}")
+        if h.argv:
+            print(f"      参数: {'  '.join(h.argv)}")
+    print(f"\n硬排除前缀: {'  '.join(SYSTEM_PREFIXES)}")
+    print(f"兜底排除名: {'  '.join(sorted(SYSTEM_BASENAMES))}")
+
+
+# ---------------------------------------------------------------- TUI
+
+C_DIM, C_SEL, C_WARN, C_OK, C_TITLE = 1, 2, 3, 4, 5
+
+
+def init_colors() -> None:
+    if not curses.has_colors():
+        return
+    curses.start_color()
+    try:
+        curses.use_default_colors()
+        bg = -1
+    except curses.error:
+        bg = curses.COLOR_BLACK
+    curses.init_pair(C_DIM, curses.COLOR_BLUE, bg)
+    curses.init_pair(C_SEL, curses.COLOR_BLACK, curses.COLOR_CYAN)
+    curses.init_pair(C_WARN, curses.COLOR_YELLOW, bg)
+    curses.init_pair(C_OK, curses.COLOR_GREEN, bg)
+    curses.init_pair(C_TITLE, curses.COLOR_CYAN, bg)
+
+
+def attr(pair: int, extra: int = 0) -> int:
+    try:
+        return curses.color_pair(pair) | extra
+    except curses.error:
+        return extra
+
+
+def confirm(stdscr, message: str) -> bool:
+    h, w = stdscr.getmaxyx()
+    lines = message.split("\n")
+    box_h = len(lines) + 4
+    box_w = max(len(l) for l in lines) + 6
+    top, left = max(0, (h - box_h) // 2), max(0, (w - box_w) // 2)
+    try:
+        win = curses.newwin(box_h, box_w, top, left)
+    except curses.error:
+        return False
+    win.bkgd(" ", attr(C_SEL))
+    win.box()
+    for i, line in enumerate(lines):
+        win.addstr(1 + i, 3, line[: box_w - 4])
+    win.addstr(box_h - 2, 3, "确认 [y/N] ")
+    win.refresh()
+    while True:
+        ch = win.getch()
+        if ch in (ord("y"), ord("Y")):
+            return True
+        if ch in (ord("n"), ord("N"), 27, ord("q")):
+            return False
+
+
+def draw_bar(stdscr, y: int, x: int, width: int, frac: float, pair: int) -> None:
+    filled = max(0, min(width, int(width * frac)))
+    try:
+        stdscr.addstr(y, x, "█" * filled, attr(pair))
+        stdscr.addstr(y, x + filled, "░" * (width - filled), attr(C_DIM))
+    except curses.error:
+        pass
+
+
+def tui(stdscr, interval: float) -> None:
+    curses.curs_set(0)
+    init_colors()
+    stdscr.timeout(int(interval * 1000))
+    curses.mousemask(0)
+
+    procs: list[Proc] = []
+    sort_mode = 0
+    sel = 0
+    detail_of: str | None = None    # 非 None 表示在某个 harness 的进程列表里
+    dsel = 0
+    status = ""
+    status_until = 0.0
+    last_scan = 0.0
+
+    while True:
+        now = time.time()
+        if now - last_scan > interval or not procs:
+            procs = scan()
+            last_scan = now
+
+        groups = sort_groups(group_procs(procs), SORTS[sort_mode][0])
+        sel = max(0, min(sel, len(groups) - 1))
+
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        mem = sys_mem()
+
+        # ---- 标题栏
+        title = f" control agent "
+        try:
+            stdscr.addstr(0, 0, title, attr(C_TITLE, curses.A_BOLD))
+            right = (f"内存 {fmt_bytes(mem['total'])} · 已用 {fmt_bytes(mem['used'])}"
+                     f" · 压缩 {fmt_bytes(mem.get('compressor', 0))} ")
+            rw, tw = dwidth(right), dwidth(title)
+            if rw < w - tw - 2:
+                stdscr.addstr(0, w - rw - 1, right, attr(C_DIM))
+            # 只画到 w-1：写到最后一个单元格会让 curses 抛错
+            stdscr.addstr(1, 0, "─" * max(0, w - 1), attr(C_DIM))
+        except curses.error:
+            pass
+
+        y = 2
+        if detail_of is None:
+            # ---- 分组视图
+            hdr = ("  " + dpad("HARNESS", 16) + dpad("进程", 5, True)
+                   + dpad("内存", 11, True) + dpad("CPU", 8, True) + "   占用分布")
+            try:
+                stdscr.addstr(y, 0, dtrunc(hdr, w - 1), attr(C_DIM)); y += 1
+                stdscr.addstr(y, 0, "  " + "─" * max(0, w - 5), attr(C_DIM)); y += 1
+            except curses.error:
+                pass
+
+            top_rss = max((g.rss_kb for g in groups), default=0)
+            bar_w = max(8, min(24, w - 62))
+            for i, g in enumerate(groups):
+                if y >= h - 3:
+                    break
+                n = len(g.procs)
+                if n:
+                    mems, cpus = fmt_mb(g.rss_kb), f"{g.cpu:.1f}%"
+                    np_ = g.protected_count
+                    if np_ == n:
+                        tail = "全部受保护（当前会话）"
+                    elif np_:
+                        tail = f"{np_} 个受保护"
+                    else:
+                        tail = ""
+                else:
+                    mems = cpus = "—"
+                    tail = "未运行"
+                line = ("  " + dpad(g.harness.label, 16)
+                        + dpad(str(n) if n else "—", 5, True)
+                        + dpad(mems, 11, True) + dpad(cpus, 8, True) + "   ")
+                lw = dwidth(line)
+                selected = (i == sel)
+                try:
+                    stdscr.addstr(y, 0, dtrunc(line, w - 1),
+                                  attr(C_SEL) if selected else 0)
+                    if n and bar_w > 4 and lw + bar_w < w - 1:
+                        draw_bar(stdscr, y, lw, bar_w,
+                                 g.rss_kb / top_rss if top_rss else 0,
+                                 C_WARN if g.protected_count else C_OK)
+                    if tail and lw + bar_w + dwidth(tail) + 2 < w - 1:
+                        stdscr.addstr(y, lw + bar_w + 1, tail, attr(C_DIM))
+                except curses.error:
+                    pass
+                y += 1
+        else:
+            # ---- 进程明细视图
+            g = next((x for x in groups if x.harness.key == detail_of), None)
+            try:
+                dtitle = f"  ▸ {g.harness.label} 的进程（{len(g.procs)}）" if g else ""
+                dhdr = ("  " + dpad("PID", 7, True) + dpad("内存", 11, True)
+                        + dpad("CPU", 8, True) + "  运行时长     路径")
+                stdscr.addstr(y, 0, dtrunc(dtitle, w - 1), attr(C_TITLE)); y += 1
+                stdscr.addstr(y, 0, dtrunc(dhdr, w - 1), attr(C_DIM)); y += 1
+                stdscr.addstr(y, 0, "  " + "─" * max(0, w - 5), attr(C_DIM)); y += 1
+            except curses.error:
+                pass
+            plist = sorted(g.procs, key=lambda p: -p.rss_kb) if g else []
+            dsel = max(0, min(dsel, len(plist) - 1))
+            for i, p in enumerate(plist):
+                if y >= h - 3:
+                    break
+                # 用 [保护] 而不是 emoji：emoji 显示宽度不定，且不是所有终端都能渲染
+                line = ("  " + dpad(str(p.pid), 7, True) + dpad(fmt_mb(p.rss_kb), 11, True)
+                        + dpad(f"{p.cpu:.1f}%", 8, True) + "  "
+                        + dpad(p.etime, 11) + dpad("[保护]" if p.protected else "", 7)
+                        + p.comm)
+                try:
+                    stdscr.addstr(y, 0, dtrunc(line, w - 1), attr(C_SEL) if i == dsel else 0)
+                except curses.error:
+                    pass
+                y += 1
+
+        # ---- 状态栏
+        if status and time.time() < status_until:
+            try:
+                stdscr.addstr(h - 2, 0, dtrunc(status, w - 1), attr(C_WARN))
+            except curses.error:
+                pass
+        try:
+            if detail_of is None:
+                keys = (f"  ↑↓ 选择   Enter 明细   k 杀掉选中   "
+                        f"s 排序({SORTS[sort_mode][1]})   r 刷新   q 退出")
+            else:
+                keys = "  ↑↓ 选择   k 杀掉选中进程   ←/Esc/q 返回"
+            stdscr.addstr(h - 1, 0, dtrunc(keys, w - 1), attr(C_TITLE))
+        except curses.error:
+            pass
+        stdscr.refresh()
+
+        # ---- 输入
+        ch = stdscr.getch()
+        if ch == -1:
+            continue
+        if ch == curses.KEY_RESIZE:
+            continue
+
+        if ch in (ord("q"), 27, curses.KEY_LEFT):
+            if detail_of is not None:
+                detail_of = None
+            else:
+                return
+            continue
+
+        # 移动只用方向键：k 已经分配给「杀」，再让 j/k 兼做移动会和杀操作撞车
+        if ch == curses.KEY_UP:
+            if detail_of is None:
+                sel -= 1
+            else:
+                dsel -= 1
+        elif ch == curses.KEY_DOWN:
+            if detail_of is None:
+                sel += 1
+            else:
+                dsel += 1
+        elif ch == ord("s"):
+            sort_mode = (sort_mode + 1) % len(SORTS)
+            status = f"排序：{SORTS[sort_mode][1]}"
+            status_until = time.time() + 1.5
+        elif ch == ord("r"):
+            procs = scan()
+            last_scan = time.time()
+            status = "已刷新"
+            status_until = time.time() + 1.0
+        elif ch in (10, 13, curses.KEY_RIGHT, ord("l")):
+            if detail_of is None:
+                if groups[sel].procs:
+                    detail_of = groups[sel].harness.key
+                    dsel = 0
+        elif ch == ord("k"):
+            if detail_of is None:
+                g = groups[sel]
+                killable = [p for p in g.procs if not p.protected]
+                if not g.procs:
+                    status, status_until = "该 harness 未运行", time.time() + 2
+                elif not killable:
+                    status = "受保护：这些进程属于当前会话，杀掉会终止你自己"
+                    status_until = time.time() + 3
+                else:
+                    skipped = len(g.procs) - len(killable)
+                    msg = f"杀掉 {g.harness.label} 的 {len(killable)} 个进程？"
+                    if skipped:
+                        msg += f"\n（跳过 {skipped} 个受保护的当前会话进程）"
+                    if confirm(stdscr, msg):
+                        gone, errs = kill_pids([p.pid for p in killable])
+                        procs = scan()
+                        last_scan = time.time()
+                        status = f"已终止 {len(gone)} 个"
+                        if errs:
+                            status += f"；{len(errs)} 个失败：{errs[0]}"
+                        status_until = time.time() + 4
+                    else:
+                        status, status_until = "已取消", time.time() + 1.5
+            else:
+                g = next((x for x in groups if x.harness.key == detail_of), None)
+                plist = sorted(g.procs, key=lambda p: -p.rss_kb) if g else []
+                if plist:
+                    p = plist[dsel]
+                    if p.protected:
+                        status = "受保护：这是当前会话的进程，杀掉会终止你自己"
+                        status_until = time.time() + 3
+                    elif confirm(stdscr, f"杀掉 pid {p.pid}？\n{p.comm}"):
+                        gone, errs = kill_pids([p.pid])
+                        procs = scan()
+                        last_scan = time.time()
+                        status = f"已终止 {len(gone)} 个" + (f"；{errs[0]}" if errs else "")
+                        status_until = time.time() + 4
+                        if not gone:
+                            detail_of = None
+                    else:
+                        status, status_until = "已取消", time.time() + 1.5
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    interval = 2.0
+    if "--interval" in args:
+        i = args.index("--interval")
+        try:
+            interval = float(args[i + 1])
+        except (IndexError, ValueError):
+            print("--interval 需要数字", file=sys.stderr)
+            return 2
+
+    procs = scan()
+    if "--list" in args:
+        print_list()
+        return 0
+    if "--json" in args:
+        print_json(procs)
+        return 0
+    if "--once" in args or not sys.stdout.isatty():
+        print_table(procs)
+        return 0
+
+    try:
+        curses.wrapper(lambda s: tui(s, interval))
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

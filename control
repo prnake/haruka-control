@@ -1,0 +1,496 @@
+#!/usr/bin/env bash
+#
+# control — 管理「飞连 (CorpLink)」与「UURemote」的后台进程与开机自启
+#
+#   control status            查看两者状态
+#   control fl status         只看飞连
+#   control uu status         只看 UURemote
+#
+#   control fl off            关闭飞连：bootout 服务 + 禁止开机自启 + 杀进程
+#   control uu off            关闭 UURemote
+#   control off               两个一起关（等价于 control all off）
+#
+#   control fl on             恢复飞连：解禁 + bootstrap + 拉起 App
+#   control uu on             恢复 UURemote
+#   control on                两个一起恢复
+#
+#   control agent             打开 TUI，查看并管理各 AI coding harness 的占用
+#                             （claude / codex / cursor / zcode / zed / kimi 等）
+#   control agent --once      打印一次表格后退出（非交互，可管道）
+#   control agent --json      输出 JSON
+#   control agent --list      列出识别到的 harness 及匹配规则
+#
+# 选项：
+#   --no-persist   不禁止开机自启 —— 重启后会自动恢复（只关这一次）
+#   --soft         只杀进程，连 launchd 服务都不动（会被 KeepAlive 立刻拉起，仅供调试）
+#   -y, --yes      跳过确认
+#   -n, --dry-run  只显示将要执行的操作，不做任何修改
+#
+# 默认行为：off 会同时禁止开机自启（launchctl disable），所以重启后不会自动恢复。
+# 想临时关一下、重启就恢复，用 --no-persist。
+#
+# 为什么不能只 kill：这两个 App 的所有 launchd 服务都是 KeepAlive=1 + RunAtLoad=1，
+# 杀掉的进程会被 launchd 在毫秒级拉回来。正确顺序是先 bootout 卸掉服务，再杀进程。
+#
+# 服务清单来自 2026-09-20 的实测结果（/Library/LaunchDaemons、/Library/LaunchAgents、
+# ~/Library/LaunchAgents 以及 launchctl list）。若 App 升级后新增了服务，control status
+# 会把「清单外服务」提示出来，补进下面 load_target() 里对应的分支即可。
+
+set -uo pipefail
+
+# ---------- 身份（兼容 sudo 与非 sudo 两种调用方式） ----------
+REAL_UID="${SUDO_UID:-$(id -u)}"
+REAL_USER="${SUDO_USER:-$(id -un)}"
+REAL_HOME="$(eval echo "~${REAL_USER}" 2>/dev/null || echo "$HOME")"
+GUI_DOMAIN="gui/${REAL_UID}"
+
+# ---------- 全量已知服务（用于「清单外服务」提示） ----------
+ALL_KNOWN_LABELS=(
+  com.corplink.mdm.policy
+  com.volcengine.corplink.service
+  com.volcengine.corplink.systemextension
+  com.volcengine.corplink.agent
+  com.netease.uuremote.daemon
+  com.netease.uuremote.agent
+  CorpLink
+)
+ALL_LS_PATTERN='^application\.com\.netease\.uuremote\.'
+
+# ---------- 输出 ----------
+if [ -t 1 ]; then
+  C_R=$'\033[31m'; C_G=$'\033[32m'; C_Y=$'\033[33m'
+  C_B=$'\033[34m'; C_D=$'\033[2m'; C_0=$'\033[0m'
+else
+  C_R=''; C_G=''; C_Y=''; C_B=''; C_D=''; C_0=''
+fi
+ok()    { printf '%s✓%s %s\n' "$C_G" "$C_0" "$*"; }
+warn()  { printf '%s!%s %s\n' "$C_Y" "$C_0" "$*"; }
+bad()   { printf '%s✗%s %s\n' "$C_R" "$C_0" "$*"; }
+info()  { printf '%s·%s %s\n' "$C_D" "$C_0" "$*"; }
+head_() { printf '\n%s== %s ==%s\n' "$C_B" "$*" "$C_0"; }
+
+# ---------- 目标装载：把 fl / uu / all 展开成一组 T_* 变量 ----------
+# T_NAME 显示名 / T_DAEMONS 系统级 LaunchDaemon / T_AGENTS 系统级 LaunchAgent
+# T_PLISTS 用户级 LaunchAgent plist / T_LSPAT LaunchServices agent 前缀 / T_PATTERNS 进程路径
+load_target() {
+  case "$1" in
+    fl)
+      T_KEY=fl; T_NAME='飞连 (CorpLink)'
+      T_DAEMONS=(com.corplink.mdm.policy com.volcengine.corplink.service com.volcengine.corplink.systemextension)
+      T_AGENTS=(com.volcengine.corplink.agent)
+      T_PLISTS=("${REAL_HOME}/Library/LaunchAgents/CorpLink.plist")
+      T_LSPAT=''
+      T_PATTERNS=('/Applications/CorpLink\.app/' '/Library/CorpLink/' '/usr/local/corplink/')
+      ;;
+    uu)
+      T_KEY=uu; T_NAME='UURemote'
+      T_DAEMONS=(com.netease.uuremote.daemon)
+      T_AGENTS=(com.netease.uuremote.agent)
+      T_PLISTS=()
+      T_LSPAT="${ALL_LS_PATTERN}"
+      T_PATTERNS=('/Applications/UURemote\.app/')
+      ;;
+    all)
+      T_KEY=all; T_NAME='飞连 + UURemote'
+      T_DAEMONS=(com.corplink.mdm.policy com.volcengine.corplink.service com.volcengine.corplink.systemextension com.netease.uuremote.daemon)
+      T_AGENTS=(com.volcengine.corplink.agent com.netease.uuremote.agent)
+      T_PLISTS=("${REAL_HOME}/Library/LaunchAgents/CorpLink.plist")
+      T_LSPAT="${ALL_LS_PATTERN}"
+      T_PATTERNS=('/Applications/CorpLink\.app/' '/Library/CorpLink/' '/usr/local/corplink/' '/Applications/UURemote\.app/')
+      ;;
+    *) bad "未知目标: ${1}（可用：fl / uu / all）"; exit 2 ;;
+  esac
+}
+
+# ---------- 工具函数 ----------
+need_sudo() {
+  [ "${DRY_RUN:-0}" = "1" ] && return 0
+  if ! sudo -n true 2>/dev/null; then
+    printf '%s需要管理员权限（这两个 App 的守护进程以 root 运行）%s\n' "$C_D" "$C_0"
+    sudo -v || { bad "无法获取 sudo 权限，中止"; exit 1; }
+  fi
+}
+
+# 当前目标匹配到的进程 pid
+matching_pids() {
+  local re
+  re="$(printf '%s|' ${T_PATTERNS[@]+"${T_PATTERNS[@]}"})"; re="${re%|}"
+  ps -Ao pid=,user=,comm= 2>/dev/null \
+    | grep -E -- "$re" \
+    | grep -v -E '[[:space:]]grep[[:space:]]' \
+    | awk '{print $1}'
+}
+
+count_procs() { matching_pids | awk 'NF' | wc -l | tr -d ' '; }
+
+# 按可执行文件聚合：数量、合计 MB、属主、路径
+proc_summary() {
+  local re
+  re="$(printf '%s|' ${T_PATTERNS[@]+"${T_PATTERNS[@]}"})"; re="${re%|}"
+  ps -Ao rss=,user=,comm= 2>/dev/null | awk -v re="$re" '
+    $0 ~ re && $0 !~ /[ \t]grep[ \t]/ {
+      rss = $1; user = $2; $1 = ""; $2 = ""; sub(/^[ \t]+/, "")
+      key = user "\t" $0
+      cnt[key]++; sum[key] += rss
+    }
+    END { for (k in cnt) printf "%d\t%d\t%s\n", cnt[k], sum[k] / 1024, k }
+  ' | sort -rn
+}
+
+# launchctl print-disabled 的输出在不同 macOS 版本里格式不一致：
+#   "com.foo" => true        （旧格式）
+#   "com.foo" => disabled    （新格式，实测于 macOS 26）
+# 两种都要匹配，否则会把「已禁用」误判成「未禁用」。
+is_disabled_label() {   # $1 = print-disabled 输出, $2 = label
+  printf '%s' "$1" | grep -qE "\"$2\"[[:space:]]*=>[[:space:]]*(true|disabled)"
+}
+
+# 按信号终止所有匹配进程；非本人的进程走 sudo
+signal_all() {
+  local sig="$1" pid owner
+  for pid in $(matching_pids); do
+    [ "$pid" = "$$" ] && continue
+    owner="$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ')"
+    [ -z "$owner" ] && continue
+    if [ "$owner" = "$REAL_USER" ]; then
+      kill "-$sig" "$pid" 2>/dev/null
+    else
+      sudo kill "-$sig" "$pid" 2>/dev/null
+    fi
+    printf '  %s信号 %-5s → pid %-6s %s%s\n' "$C_D" "$sig" "$pid" "$owner" "$C_0"
+  done
+}
+
+# 已加载但不在清单里的相关服务（App 升级后可能新增）
+report_unknown_services() {
+  local line label k known
+  while IFS= read -r line; do
+    label="$(printf '%s' "$line" | awk '{print $3}')"
+    [ -z "$label" ] && continue
+    case "$label" in
+      *corplink*|*CorpLink*|*uuremote*|*UURemote*) ;;
+      *) continue ;;
+    esac
+    known=0
+    for k in ${ALL_KNOWN_LABELS[@]+"${ALL_KNOWN_LABELS[@]}"}; do
+      [ "$label" = "$k" ] && known=1 && break
+    done
+    [ "$known" = "1" ] && continue
+    printf '%s' "$label" | grep -qE "$ALL_LS_PATTERN" && continue
+    warn "清单外的相关服务：$label  ${C_D}（App 升级后可能新增，可补进 load_target）${C_0}"
+  done < <(launchctl list 2>/dev/null)
+  return 0
+}
+
+# 目标专属的风险提示
+target_warning() {
+  case "$T_KEY" in
+    fl|all)
+      printf '\n%s注意：飞连是 MDM 下发的企业零信任接入客户端。%s\n' "$C_Y" "$C_0"
+      printf '  关闭后会立即断开公司内网 / VPN；若你正通过 SSH、远程桌面连到本机，\n'
+      printf '  会话可能中断。设备受企业管控时，此操作可能触发合规告警。\n'
+      ;;
+  esac
+  case "$T_KEY" in
+    uu|all)
+      printf '\n%s注意：UURemote 是远程控制软件。%s\n' "$C_Y" "$C_0"
+      printf '  关闭后你将无法从外部远程连接本机；若当前正通过它连过来，会直接断线。\n'
+      ;;
+  esac
+  printf '\n'
+}
+
+# ---------- status ----------
+cmd_status() {
+  local target="$1"
+  local sudo_ok=0 disabled_sys='' disabled_gui=''
+  sudo -n true 2>/dev/null && sudo_ok=1
+  [ "$sudo_ok" = "1" ] && disabled_sys="$(sudo launchctl print-disabled system 2>/dev/null)"
+  disabled_gui="$(launchctl print-disabled "${GUI_DOMAIN}" 2>/dev/null)"
+
+  local t
+  for t in $(targets_of "$target"); do
+    load_target "$t"
+    head_ "$T_NAME"
+
+    # --- 进程 ---
+    local n; n="$(count_procs)"
+    if [ "$n" = "0" ]; then
+      ok "无相关进程"
+    else
+      local rss c m u p
+      rss="$(matching_pids | while read -r pid; do ps -o rss= -p "$pid" 2>/dev/null; done \
+             | awk '{s+=$1} END {printf "%.0f", s/1024}')"
+      info "进程 $n 个，合计 ${rss:-0} MB"
+      proc_summary | while IFS=$'\t' read -r c m u p; do
+        printf '   %3s × %7s MB  %-6s %s\n' "$c" "$m" "$u" "$p"
+      done
+    fi
+
+    # --- system 域服务 ---
+    info "system 域："
+    if [ "$sudo_ok" != "1" ]; then
+      printf '   %s?%s  未查询（需要管理员：sudo control %s status）\n' "$C_Y" "$C_0" "$t"
+    else
+      local l
+      for l in ${T_DAEMONS[@]+"${T_DAEMONS[@]}"}; do
+        if is_disabled_label "$disabled_sys" "$l"; then
+          printf '   %s已禁用%s %-46s %s(重启也不会恢复)%s\n' "$C_Y" "$C_0" "$l" "$C_D" "$C_0"
+        elif sudo launchctl print "system/$l" >/dev/null 2>&1; then
+          printf '   %s运行中%s %-46s\n' "$C_R" "$C_0" "$l"
+        else
+          printf '   %s已停用%s %-46s %s(重启后会恢复)%s\n' "$C_G" "$C_0" "$l" "$C_D" "$C_0"
+        fi
+      done
+    fi
+
+    # --- gui 域服务 ---
+    info "gui 域："
+    local labels l
+    labels="$( {
+      for l in ${T_AGENTS[@]+"${T_AGENTS[@]}"}; do printf '%s\n' "$l"; done
+      if [ -n "$T_LSPAT" ]; then
+        launchctl list 2>/dev/null | awk '{print $3}' | grep -E "$T_LSPAT"
+      fi
+    } | awk 'NF' | sort -u )"
+    if [ -z "$labels" ]; then
+      printf '   %s（无）%s\n' "$C_D" "$C_0"
+    else
+      for l in $labels; do
+        if is_disabled_label "$disabled_gui" "$l"; then
+          printf '   %s已禁用%s %-46s %s(重启也不会恢复)%s\n' "$C_Y" "$C_0" "$l" "$C_D" "$C_0"
+        elif launchctl print "${GUI_DOMAIN}/$l" >/dev/null 2>&1; then
+          printf '   %s运行中%s %-46s\n' "$C_R" "$C_0" "$l"
+        else
+          printf '   %s已停用%s %-46s %s(重启后会恢复)%s\n' "$C_G" "$C_0" "$l" "$C_D" "$C_0"
+        fi
+      done
+    fi
+    for l in ${T_PLISTS[@]+"${T_PLISTS[@]}"}; do
+      [ -f "$l" ] || continue
+      info "用户级 plist：${l##*/} 存在（未在上面列出说明未加载）"
+    done
+  done
+
+  report_unknown_services
+}
+
+# 把目标展开成要逐个处理的列表
+targets_of() {
+  case "$1" in
+    all) printf 'fl\nuu\n' ;;
+    fl|uu) printf '%s\n' "$1" ;;
+  esac
+}
+
+# ---------- off ----------
+cmd_off() {
+  local target="$1"; shift
+  local soft=0 persist=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --soft)       soft=1 ;;
+      --no-persist) persist=0 ;;
+      -y|--yes)     ASSUME_YES=1 ;;
+      -n|--dry-run) DRY_RUN=1 ;;
+      *) bad "未知选项: $1"; exit 2 ;;
+    esac
+    shift
+  done
+
+  load_target "$target"
+  target_warning
+
+  local n; n="$(count_procs)"
+  if [ "$n" = "0" ]; then
+    info "当前没有匹配的进程；仍会处理 launchd 服务，防止被重新拉起"
+  fi
+
+  if [ "$DRY_RUN" != "1" ] && [ "${ASSUME_YES:-0}" != "1" ]; then
+    if [ ! -t 0 ]; then
+      bad "非交互环境，请显式加 -y 确认"
+      exit 2
+    fi
+    printf '确认关闭「%s」？[y/N] ' "$T_NAME"
+    local a; read -r a
+    case "$a" in y|Y|yes|YES) ;; *) info "已取消"; exit 0 ;; esac
+  fi
+
+  need_sudo
+
+  if [ "$soft" = "1" ]; then
+    warn "--soft：只杀进程不动服务，launchd 会因 KeepAlive 立刻把它们拉起来"
+  else
+    head_ "卸载 launchd 服务"
+    local l p
+    for l in ${T_DAEMONS[@]+"${T_DAEMONS[@]}"}; do
+      if [ "$DRY_RUN" = "1" ]; then info "[dry] sudo launchctl bootout system/$l"; continue; fi
+      if sudo launchctl bootout "system/$l" 2>/dev/null; then ok "bootout system/$l"
+      else info "system/$l 未加载，跳过"; fi
+    done
+    for l in ${T_AGENTS[@]+"${T_AGENTS[@]}"}; do
+      if [ "$DRY_RUN" = "1" ]; then info "[dry] launchctl bootout ${GUI_DOMAIN}/$l"; continue; fi
+      if launchctl bootout "${GUI_DOMAIN}/$l" 2>/dev/null; then ok "bootout ${GUI_DOMAIN}/$l"
+      else info "${GUI_DOMAIN}/$l 未加载，跳过"; fi
+    done
+    for p in ${T_PLISTS[@]+"${T_PLISTS[@]}"}; do
+      [ -f "$p" ] || continue
+      if [ "$DRY_RUN" = "1" ]; then info "[dry] launchctl bootout ${GUI_DOMAIN} ${p##*/}"; continue; fi
+      if launchctl bootout "${GUI_DOMAIN}" "$p" 2>/dev/null; then ok "bootout ${p##*/}"
+      else info "${p##*/} 未加载，跳过"; fi
+    done
+    if [ -n "$T_LSPAT" ]; then
+      for l in $(launchctl list 2>/dev/null | awk '{print $3}' | grep -E "$T_LSPAT"); do
+        if [ "$DRY_RUN" = "1" ]; then info "[dry] launchctl bootout ${GUI_DOMAIN}/$l"; continue; fi
+        launchctl bootout "${GUI_DOMAIN}/$l" 2>/dev/null && ok "bootout $l"
+      done
+    fi
+
+    head_ "开机自启"
+    if [ "$persist" = "1" ]; then
+      for l in ${T_DAEMONS[@]+"${T_DAEMONS[@]}"}; do
+        [ "$DRY_RUN" = "1" ] && { info "[dry] sudo launchctl disable system/$l"; continue; }
+        sudo launchctl disable "system/$l" 2>/dev/null && ok "已禁止开机自启 system/$l"
+      done
+      for l in ${T_AGENTS[@]+"${T_AGENTS[@]}"}; do
+        [ "$DRY_RUN" = "1" ] && { info "[dry] launchctl disable ${GUI_DOMAIN}/$l"; continue; }
+        launchctl disable "${GUI_DOMAIN}/$l" 2>/dev/null && ok "已禁止开机自启 ${GUI_DOMAIN}/$l"
+      done
+    else
+      info "--no-persist：保留开机自启，重启后会自动恢复"
+    fi
+  fi
+
+  head_ "终止进程"
+  if [ "$DRY_RUN" = "1" ]; then
+    info "[dry] 将终止 $(count_procs) 个进程"
+  else
+    signal_all TERM
+    sleep 1
+    local left; left="$(count_procs)"
+    if [ "$left" != "0" ]; then
+      warn "仍有 $left 个进程存活，发送 SIGKILL"
+      signal_all KILL
+      sleep 1
+    fi
+  fi
+
+  head_ "验证"
+  if [ "$DRY_RUN" = "1" ]; then
+    info "[dry] 跳过验证"
+    return 0
+  fi
+  local remain; remain="$(count_procs)"
+  if [ "$remain" = "0" ]; then
+    ok "全部进程已退出"
+  else
+    bad "仍有 $remain 个进程存活："
+    local pid
+    for pid in $(matching_pids); do
+      printf '  %s\n' "$(ps -o pid=,user=,comm= -p "$pid" 2>/dev/null)"
+    done
+    warn "可能是受 SIP 保护的组件，或 App 已被重新启动"
+  fi
+  if [ "$soft" = "1" ]; then
+    info "--soft 模式：服务仍在，进程很可能已被 launchd 重新拉起"
+  elif [ "$persist" = "1" ]; then
+    info "已禁止开机自启，重启后不会恢复；要还原用 control $target on"
+  else
+    info "重启后会自动恢复"
+  fi
+}
+
+# ---------- on ----------
+cmd_on() {
+  local target="$1"; shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -n|--dry-run) DRY_RUN=1 ;;
+      -y|--yes) ;;
+      *) bad "未知选项: $1"; exit 2 ;;
+    esac
+    shift
+  done
+
+  load_target "$target"
+  need_sudo
+
+  head_ "恢复「${T_NAME}」"
+  local l p
+  for l in ${T_DAEMONS[@]+"${T_DAEMONS[@]}"}; do
+    if [ "$DRY_RUN" = "1" ]; then info "[dry] sudo launchctl enable+bootstrap system/$l"; continue; fi
+    sudo launchctl enable "system/$l" 2>/dev/null
+    if sudo launchctl bootstrap "system" "/Library/LaunchDaemons/$l.plist" 2>/dev/null; then ok "bootstrap system/$l"
+    else info "system/$l 已加载或 plist 缺失"; fi
+  done
+  for l in ${T_AGENTS[@]+"${T_AGENTS[@]}"}; do
+    if [ "$DRY_RUN" = "1" ]; then info "[dry] launchctl enable+bootstrap ${GUI_DOMAIN}/$l"; continue; fi
+    launchctl enable "${GUI_DOMAIN}/$l" 2>/dev/null
+    if launchctl bootstrap "${GUI_DOMAIN}" "/Library/LaunchAgents/$l.plist" 2>/dev/null; then ok "bootstrap $l"
+    else info "$l 已加载或 plist 缺失"; fi
+  done
+  for p in ${T_PLISTS[@]+"${T_PLISTS[@]}"}; do
+    [ -f "$p" ] || continue
+    [ "$DRY_RUN" = "1" ] && { info "[dry] launchctl bootstrap ${p##*/}"; continue; }
+    launchctl bootstrap "${GUI_DOMAIN}" "$p" 2>/dev/null && ok "bootstrap ${p##*/}"
+  done
+
+  head_ "拉起 App"
+  local app
+  for app in $(targets_of "$target"); do
+    case "$app" in
+      fl) app='CorpLink' ;;
+      uu) app='UURemote' ;;
+    esac
+    if [ "$DRY_RUN" = "1" ]; then info "[dry] open -a $app"; continue; fi
+    open -a "$app" 2>/dev/null && ok "已启动 $app" || warn "未能启动 $app"
+  done
+  if [ "$DRY_RUN" != "1" ]; then
+    sleep 2
+    info "当前匹配进程：$(count_procs) 个"
+  fi
+}
+
+# ---------- 入口 ----------
+usage() {
+  awk 'NR>1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"
+}
+
+ASSUME_YES=0
+DRY_RUN=0
+
+# 解析：control [target] <action> [选项]
+case "${1:-}" in
+  ""|-h|--help|help) usage; exit 0 ;;
+  status|off|on)
+    # control off / control on / control status → 作用于 all
+    action="$1"; shift
+    case "$action" in
+      status) cmd_status all ;;
+      off)    cmd_off all "$@" ;;
+      on)     cmd_on  all "$@" ;;
+    esac
+    ;;
+  fl|uu|all)
+    target="$1"; shift
+    case "${1:-}" in
+      status) shift; cmd_status "$target" ;;
+      off)    shift; cmd_off "$target" "$@" ;;
+      on)     shift; cmd_on  "$target" "$@" ;;
+      "")     bad "缺少动作：control $target {on|off|status}"; exit 2 ;;
+      *)      bad "未知动作: ${1}（可用：on / off / status）"; exit 2 ;;
+    esac
+    ;;
+  agent)
+    shift
+    here="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+    agent_bin="${here}/control-agent"
+    if [ ! -x "$agent_bin" ]; then
+      bad "找不到 ${agent_bin}"
+      info "control-agent 需要和 control 放在同一个目录"
+      exit 1
+    fi
+    exec python3 "$agent_bin" "$@"
+    ;;
+  *) bad "未知命令: $1"; printf '\n'; usage; exit 2 ;;
+esac
