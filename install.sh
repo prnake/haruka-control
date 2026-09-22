@@ -66,7 +66,7 @@ if [ -z "$SRC" ] || [ ! -f "$SRC/control" ] || [ ! -f "$SRC/control-agent" ]; th
   for f in control control-agent SHA256SUMS; do
     info "下载 ${f}…"
     if ! curl -fsSL --connect-timeout 5 --max-time 60 -o "${tmp}/${f}" \
-        "${GH_BASE}/${REPO}/download/${tag}/${f}"; then
+        "${GH_BASE}/${REPO}/releases/download/${tag}/${f}"; then
       # SHA256SUMS 是可选资产（老 release 没有），缺了不致命
       if [ "$f" = "SHA256SUMS" ]; then
         : > "${tmp}/SHA256SUMS"

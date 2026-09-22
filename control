@@ -121,8 +121,9 @@ latest_tag() {
 
 download_release_asset() {
   # $1 = tag, $2 = 文件名, $3 = 落盘路径。失败返回非 0。
+  # 注意路径是 releases/download/<tag>/<asset>（少了 releases/ 就是 404）
   curl -fsSL --connect-timeout 2 --max-time 60 -o "$3" \
-    "${GH_BASE}/${REPO}/download/${1}/${2}"
+    "${GH_BASE}/${REPO}/releases/download/${1}/${2}"
 }
 
 maybe_update_notice() {
