@@ -19,6 +19,15 @@
 #   control agent --once      打印一次表格后退出（非交互，可管道）
 #   control agent --json      输出 JSON
 #   control agent --list      列出识别到的 harness 及匹配规则
+#   control agent history     浏览 / 搜索所有历史的 Claude Code 会话，
+#                             Enter 在当前终端恢复该会话（claude --resume）
+#
+#   control update            检查并安装最新 release（--force 忽略版本比较重装）
+#   control version           打印当前版本
+#
+# 每次（交互式）启动会顺带检查一次新版（每 24h 最多联网一次，结果缓存），
+# 发现新版会提示一行。设 HARUKA_NO_UPDATE_CHECK=1 可关闭。
+# 两个环境变量供 fork / 测试覆盖：HARUKA_GH_BASE、HARUKA_REPO。
 #
 # 选项：
 #   --no-persist   不禁止开机自启 —— 重启后会自动恢复（只关这一次）
@@ -68,6 +77,151 @@ warn()  { printf '%s!%s %s\n' "$C_Y" "$C_0" "$*"; }
 bad()   { printf '%s✗%s %s\n' "$C_R" "$C_0" "$*"; }
 info()  { printf '%s·%s %s\n' "$C_D" "$C_0" "$*"; }
 head_() { printf '\n%s== %s ==%s\n' "$C_B" "$*" "$C_0"; }
+
+# ---------- 版本与更新 ----------
+# VERSION 是唯一版本来源。仓库里恒为 0.0.0-dev；release workflow 在打 tag 时把
+# 它 sed 成 tag 名（见 .github/workflows/release.yml），所以只有 release 资产里的
+# control 才带真实版本 —— curl 安装 / control update 拿到的都是它。
+VERSION="0.0.0-dev"
+GH_BASE="${HARUKA_GH_BASE:-https://github.com}"
+REPO="${HARUKA_REPO:-prnake/haruka-control}"
+UPDATE_STATE="${HOME}/.cache/haruka-control/update-state"
+
+ver_gt() {
+  # $1 > $2 才返回 0（语义版本比较；预发布后缀 -xxx 直接截掉，不当数值比）
+  local a b i x y
+  a="${1#v}"; b="${2#v}"
+  a="${a%%-*}"; b="${b%%-*}"
+  local IFS=.
+  # shellcheck disable=SC2206
+  local -a A=($a) B=($b)
+  for i in 0 1 2 3; do
+    x="${A[i]:-0}"; y="${B[i]:-0}"
+    case "$x$y" in *[!0-9]*) return 1 ;; esac   # 非数字不当成可比，保守判否
+    # 10# 强制十进制：否则 "09" 会被当八进制，比较直接报错
+    if [ "$((10#$x))" -gt "$((10#$y))" ]; then return 0; fi
+    if [ "$((10#$x))" -lt "$((10#$y))" ]; then return 1; fi
+  done
+  return 1
+}
+
+self_path() {
+  # 正在运行的 control 自己的绝对路径（update 要往它所在目录装新文件）
+  local p="${BASH_SOURCE[0]}"
+  case "$p" in /*) printf '%s\n' "$p" ;; *) printf '%s\n' "$PWD/$p" ;; esac
+}
+
+latest_tag() {
+  # 不用 GitHub API（免 token、免限流）：releases/latest 会 302 到 /tag/vX.Y.Z，
+  # 问 curl 要最终 URL 再取末段。失败返回空串。
+  curl -fsSL --connect-timeout 2 --max-time 6 -o /dev/null -w '%{url_effective}' \
+    "${GH_BASE}/${REPO}/releases/latest" 2>/dev/null \
+    | sed -n 's|.*/tag/\(.*\)$|\1|p'
+}
+
+download_release_asset() {
+  # $1 = tag, $2 = 文件名, $3 = 落盘路径。失败返回非 0。
+  curl -fsSL --connect-timeout 2 --max-time 60 -o "$3" \
+    "${GH_BASE}/${REPO}/download/${1}/${2}"
+}
+
+maybe_update_notice() {
+  # 每次交互式启动时调用：有新版就提示一行。联网检查按 TTL 节流 ——
+  # 86400s 正常 / 3600s（上次失败），但已知的新版本每次启动都持续提示（不联网）。
+  [ -t 1 ] || return 0
+  [ "${HARUKA_NO_UPDATE_CHECK:-0}" = "1" ] && return 0
+  case "$VERSION" in *-dev) return 0 ;; esac    # dev 安装（仓库里直接跑）不参与
+  case "${1:-}" in
+    update|version|-h|--help|help|"") return 0 ;;   # 这些命令自己会处理版本
+  esac
+
+  local now last tag ttl t
+  now="$(date +%s)"; last=0; tag=""
+  if [ -f "$UPDATE_STATE" ]; then
+    last="$(sed -n '1p' "$UPDATE_STATE" 2>/dev/null)"
+    tag="$(sed -n '2p' "$UPDATE_STATE" 2>/dev/null)"
+  fi
+  case "$tag" in ""|-) ttl=3600 ;; *) ttl=86400 ;; esac
+  if [ -z "$tag" ] || [ $((now - ${last:-0})) -ge "$ttl" ]; then
+    t="$(latest_tag)"
+    tag="${t:--}"                               # 查不到也记账，避免离线时每次都等 curl 超时
+    mkdir -p "$(dirname "$UPDATE_STATE")" 2>/dev/null
+    printf '%s\n%s\n' "$now" "$tag" > "$UPDATE_STATE" 2>/dev/null
+  fi
+  if [ -n "$tag" ] && [ "$tag" != "-" ] && ver_gt "$tag" "$VERSION"; then
+    warn "有新版 ${tag}（当前 ${VERSION}）：control update"
+  fi
+  return 0
+}
+
+cmd_update() {
+  local force=0
+  case "${1:-}" in
+    --force) force=1 ;;
+    "") ;;
+    *) bad "未知选项: $1（可用：--force）"; exit 2 ;;
+  esac
+
+  info "当前版本：${VERSION}"
+  local tag
+  tag="$(latest_tag)"
+  if [ -z "$tag" ]; then
+    bad "查询最新版本失败（网络不通？或 ${REPO} 还没有发布过 release）"
+    exit 1
+  fi
+  info "最新版本：${tag}"
+
+  if [ "$force" != "1" ]; then
+    if [ "$VERSION" = "$tag" ]; then
+      ok "已是最新（${tag}）"
+      exit 0
+    fi
+    if ! ver_gt "$tag" "$VERSION"; then
+      info "本地版本不低于线上（${VERSION} ≥ ${tag}），不重装；强制重装用 control update --force"
+      exit 0
+    fi
+  fi
+
+  # 装到「正在运行的 control」所在目录，而不是写死的 ~/.local/bin ——
+  # PREFIX 安装到别处的用户也能自助更新。
+  local self dst
+  self="$(self_path)"
+  dst="$(cd "$(dirname "$self")" 2>/dev/null && pwd)"
+  if [ -z "$dst" ]; then
+    bad "定位不了自己（${self}）"
+    exit 1
+  fi
+  if [ -d "${dst}/.git" ] || [ -f "${dst}/install.sh" ]; then
+    bad "这是仓库检出目录（${dst}），control update 会覆盖源码"
+    info "开发环境请 git pull && ./install.sh；日常用安装副本（~/.local/bin/control update）"
+    exit 1
+  fi
+
+  (
+    set -e
+    tmp="$(mktemp -d "${TMPDIR:-/tmp}/haruka-update.XXXXXX")"
+    trap 'rm -rf "$tmp"' EXIT
+    for f in control control-agent SHA256SUMS; do
+      info "下载 ${f}…"
+      if ! download_release_asset "$tag" "$f" "${tmp}/${f}"; then
+        bad "下载 ${f} 失败"
+        exit 1
+      fi
+    done
+    # release 资产带 SHA256SUMS 就校验，缺了就跳过（老 release 没有）
+    if command -v shasum >/dev/null 2>&1 && [ -s "${tmp}/SHA256SUMS" ]; then
+      (cd "$tmp" && grep -E '  (control|control-agent)$' SHA256SUMS | shasum -a 256 -c -) \
+        || { bad "SHA256 校验失败，放弃安装"; exit 1; }
+    fi
+    for f in control control-agent; do
+      # 先写 .new 再 mv：bash 是边读边执行的，直接覆盖正在跑的脚本可能读到半截文件
+      install -m 0755 "${tmp}/${f}" "${dst}/${f}.new"
+      mv -f "${dst}/${f}.new" "${dst}/${f}"
+    done
+  ) || exit 1
+  ok "已更新到 ${tag}（${dst}）"
+  info "正在跑的 TUI 不受影响，下次启动用新版"
+}
 
 # ---------- 目标装载：把 fl / uu / all 展开成一组 T_* 变量 ----------
 # T_NAME 显示名 / T_DAEMONS 系统级 LaunchDaemon / T_AGENTS 系统级 LaunchAgent
@@ -459,9 +613,14 @@ usage() {
 ASSUME_YES=0
 DRY_RUN=0
 
+# 启动时的新版提示（内部自带节流；dev 版 / 非交互 / 关闭开关时直接返回）
+maybe_update_notice "${1:-}"
+
 # 解析：control [target] <action> [选项]
 case "${1:-}" in
   ""|-h|--help|help) usage; exit 0 ;;
+  version) printf 'haruka-control %s\n' "$VERSION" ;;
+  update)  shift; cmd_update "$@" ;;
   status|off|on)
     # control off / control on / control status → 作用于 all
     action="$1"; shift

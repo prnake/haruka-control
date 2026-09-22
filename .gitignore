@@ -7,3 +7,6 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+# oh-my-claudecode 本地状态
+.omc/

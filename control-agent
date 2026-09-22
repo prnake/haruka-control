@@ -7,6 +7,7 @@ control agent — 交互式 TUI，查看并管理各 AI coding harness 的资源
     control agent --once       打印一次表格后退出（非交互，可管道）
     control agent --json       输出 JSON
     control agent --list       列出识别到的 harness 及其匹配规则
+    control agent history      浏览 / 搜索所有历史的 Claude Code 会话
 
 键位（TUI）:
     ↑/↓ 或 j/k   移动选择
@@ -14,8 +15,19 @@ control agent — 交互式 TUI，查看并管理各 AI coding harness 的资源
     k            杀掉选中项（在列表里=整组，在进程里=单个）
     t            切换详情页的会话面板（token 用量 / 标题 / 最近提问）
     s            切换排序：内存 / CPU / 名称
+    H            打开历史会话浏览（见下方键位）
     r            立即刷新
     q / Esc      返回上一层 / 退出
+
+键位（历史会话浏览，control agent history 或按 H）:
+    ↑/↓ / PgUp/PgDn   移动选择
+    Enter / l    在当前终端恢复选中的会话（exec claude --resume <sid>）
+    /            搜索：关键词命中 标题 / 全部提问 / 项目路径 / 会话 id，
+                 多个词按空格分隔、全部命中才算匹配
+    s            切换排序：时间新→旧 / 时间旧→新 / 大小
+    t            切换详情面板（token 用量 / 标题 / 最近提问）
+    r            重新扫描会话列表
+    Esc          返回 agent 视图（若从那里进入），q 退出
 
 匹配策略（重要）:
     macOS 上按名字做子串匹配会误伤 —— 例如 CursorUIViewService.xpc（系统文字
@@ -36,6 +48,7 @@ import glob
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -623,14 +636,18 @@ def claude_session_file(sid: str) -> str:
     return hits[0] if hits else ""
 
 
-def session_stats(sid: str) -> dict | None:
+def session_stats(sid: str, path: str = "") -> dict | None:
     """
     解析一个会话文件，汇总 token 用量、模型名、消息数与标题。实测 15-29ms（8MB 文件）。
 
     token 字段在每条 assistant 记录的 message.usage 里；<synthetic> 是系统注入的
     合成消息，实测它们四个 token 字段全是 0，直接跳过免得污染模型名的统计。
+
+    path 留空时才走 claude_session_file() 的 glob —— 调用方已经拿着确切路径时
+    （历史会话浏览就是这么用的），省掉一次全目录扫描。
     """
-    path = claude_session_file(sid)
+    if not path:
+        path = claude_session_file(sid)
     if not path:
         return None
 
@@ -785,6 +802,147 @@ def proc_cwd(pid: int) -> str:
 
 # 进入详情视图时最多查多少个进程的 cwd：每个约 30ms，一次查太多会明显卡顿
 CWD_LOOKUP_MAX = 12
+
+
+# ---------------------------------------------------------------- 历史会话浏览
+
+
+@dataclass
+class SessionRow:
+    """一条历史会话。agent TUI 只看得到「正在跑」的进程，这里看的是磁盘上的全部。"""
+    sid: str
+    path: str                 # 落盘的 jsonl 路径
+    project: str              # 会话的项目目录（优先取 history.jsonl 的原始路径）
+    mtime: float              # 文件最后修改时间，排序主键
+    size: int
+    prompts: list = field(default_factory=list)   # 该会话全部提问（含斜杠命令）
+    title: str = ""           # aiTitle，懒加载（要读整个文件）
+    stats: dict | None = None  # token 统计，懒加载；解析失败时为 {"failed": True} 防止重试
+    hay: str = ""             # 搜索用的全文本（标题+提问+项目+sid），懒构建
+
+
+def decode_project_dir(name: str) -> str:
+    """
+    把 projects/ 下的目录名尽力解码回路径，只服务于极少数不在 history.jsonl 里的会话。
+
+    Claude Code 的编码是把 cwd 里的 / 换成 -，这个变换不可逆：com~apple~CloudDocs
+    会变成 com-apple-CloudDocs，还原时 - 到底原来是 / 还是 - 无从判断。history.jsonl
+    的 project 字段存的是原始路径，所以主路径永远从那里取，这里只是兜底。
+    """
+    s = name.replace("-", "/")
+    return s if s.startswith("/") else "/" + s
+
+
+def collect_sessions() -> list[SessionRow]:
+    """
+    列出所有历史会话：projects/*/*.jsonl 是事实来源（启动了但一个字没敲就退出的会话
+    不会进 history.jsonl，但仍占着文件）；history.jsonl 负责补充精确的项目路径、
+    首末活动时间和提问列表。全量 87 个文件、173MB 的实测规模下，这里只做 scandir，
+    一个文件都不读，耗时 <10ms —— 读文件是后面按可见行懒加载的事。
+    """
+    by_sid: dict[str, tuple[str, list]] = {}
+    for proj, sessions in load_history().items():
+        for sid, entries in sessions.items():
+            if entries:
+                by_sid[sid] = (proj, [d for _, d in entries])
+
+    rows: list[SessionRow] = []
+    try:
+        pdirs = sorted(os.scandir(PROJECTS_DIR), key=lambda e: e.name)
+    except OSError:
+        return rows
+    for d in pdirs:
+        if not d.is_dir():
+            continue
+        try:
+            files = sorted(os.scandir(d.path), key=lambda e: e.name)
+        except OSError:
+            continue
+        for f in files:
+            if not f.name.endswith(".jsonl") or f.name.startswith("."):
+                continue
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            sid = f.name[:-6]
+            proj, prompts = by_sid.get(sid, ("", []))
+            rows.append(SessionRow(sid, f.path, proj or decode_project_dir(d.name),
+                                   st.st_mtime, st.st_size, prompts))
+    return rows
+
+
+def session_cwd_from_file(path: str) -> str:
+    """
+    从会话文件头几条记录里读 cwd（Enter 恢复会话时，项目目录已不存在的情况下才用）。
+
+    不能只读第一行：实测第一行往往是 {"type":"mode"} 这类元信息，cwd 在第一条
+    message 记录里。也不设硬上限直接全读 —— 特意限定条数，正常会话头几行必然命中。
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for _, line in zip(range(40), f):
+                if '"cwd"' not in line:
+                    continue
+                try:
+                    cwd = json.loads(line).get("cwd")
+                except ValueError:
+                    continue
+                if cwd:
+                    return cwd
+    except OSError:
+        pass
+    return ""
+
+
+def row_hay(r: SessionRow) -> str:
+    """搜索索引。标题懒加载完成后由调用方清掉 r.hay 触发重建。"""
+    if not r.hay:
+        r.hay = (r.title + "\n" + "\n".join(str(d) for d in r.prompts)
+                 + "\n" + r.project + " " + r.sid).lower()
+    return r.hay
+
+
+def row_match(r: SessionRow, q: str) -> bool:
+    """多词按空格分隔、AND 语义 —— 搜「haruka readme」想找的是同时提到两者的会话。"""
+    if not q:
+        return True
+    hay = row_hay(r)
+    return all(word in hay for word in q.lower().split())
+
+
+def row_text(r: SessionRow) -> tuple[str, str, str]:
+    """列表行的三要素：时间 / 标题（或最近提问）/ 项目路径（~ 缩写）。"""
+    t = time.localtime(r.mtime)
+    if t.tm_year == time.localtime().tm_year:
+        when = time.strftime("%m-%d %H:%M", t)
+    else:
+        when = time.strftime("%Y-%m-%d", t)
+    home = os.path.expanduser("~")
+    if r.project == home:
+        proj = "~"
+    elif r.project.startswith(home + "/"):
+        proj = "~" + r.project[len(home):]
+    else:
+        proj = r.project
+    meaningful = [d for d in r.prompts if not str(d).lstrip().startswith("/")]
+    source = meaningful or r.prompts
+    text = str(r.title or (source[-1] if source else "") or "(无标题，无提问)")
+    return when, text, proj
+
+
+def print_history_table(rows: list[SessionRow]) -> None:
+    """非交互（管道）下的 history 输出：按修改时间倒序的前 30 条。"""
+    rows = sorted(rows, key=lambda r: -r.mtime)
+    print(f"共 {len(rows)} 个会话（按最后修改时间倒序，只显示前 30 条）")
+    print("  " + dpad("时间", 12) + dpad("标题 / 最近提问", 44) + "项目")
+    print("  " + "-" * 78)
+    for r in rows[:30]:
+        when, text, proj = row_text(r)
+        text = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+        print("  " + dpad(when, 12) + dpad(dtrunc(text, 44), 44) + proj)
+    if len(rows) > 30:
+        print(f"  … 其余 {len(rows) - 30} 条未显示")
 
 
 def draw_bar(stdscr, y: int, x: int, width: int, frac: float, pair: int) -> None:
@@ -1043,7 +1201,7 @@ def tui(stdscr, interval: float) -> None:
         try:
             if detail_of is None:
                 keys = (f"  方向键 选择   Enter 明细   k 杀掉选中   "
-                        f"s 排序({SORTS[sort_mode][1]})   r 刷新   q 退出")
+                        f"s 排序({SORTS[sort_mode][1]})   H 历史   r 刷新   q 退出")
             else:
                 keys = (f"  方向键 选择   k 杀掉选中进程   t 会话面板"
                         f"({'开' if show_panel else '关'})   Esc/q 返回")
@@ -1098,6 +1256,9 @@ def tui(stdscr, interval: float) -> None:
             show_panel = not show_panel
             status = f"会话面板：{'开' if show_panel else '关'}"
             status_until = time.time() + 1.5
+        elif ch == ord("H"):
+            # 大写 H：h 小写留给未来的移动键，H 也是 vim 里「History」的直觉位置
+            return "history"
         elif ch == ord("r"):
             procs = scan()
             last_scan = time.time()
@@ -1160,8 +1321,286 @@ def tui(stdscr, interval: float) -> None:
                         status, status_until = "已取消", time.time() + 1.5
 
 
+# ---------------------------------------------------------------- 历史会话 TUI
+
+H_SORTS = [("mtime", "时间新→旧"), ("mtime_asc", "时间旧→新"), ("size", "大小")]
+H_PANEL_H = 8           # 详情面板预留行数（与 agent 视图的 PANEL_H 对齐）
+H_LOAD_PER_FRAME = 2    # 每帧最多解析几个会话文件（单个 15-100ms，多了按键会发粘）
+
+
+def resume_session(stdscr, row: SessionRow, claude_bin: str) -> None:
+    """
+    Enter 恢复会话：还原终端后 exec claude --resume <sid>，直接落进那个对话。
+
+    为什么用 exec 而不是 subprocess：TUI 的使命到此为止，进程应该被直接换掉 ——
+    subprocess 要等 claude 退出再收尾，用户退出 claude 后还会落回这个空壳 python。
+    exec 换出后，claude 退出时用户看到的就是原本的 shell，和手敲
+    claude --resume 的体验完全一致。
+
+    必须先手工还原终端：curses.wrapper 的还原代码在 finally 里，而 exec 不走
+    finally，直接换进程会把终端留在 raw 模式（无回显、无行缓冲）。
+
+    项目目录优先用 history.jsonl 的原始路径；目录已被删掉时再读会话文件头部的
+    cwd 记录；两条路都失败就在当前目录起 claude —— 会话 id 全局唯一，
+    --resume 不依赖 cwd 也能定位到会话。
+    """
+    cwd = row.project if os.path.isdir(row.project) else session_cwd_from_file(row.path)
+    try:
+        curses.curs_set(1)
+    except curses.error:
+        pass
+    try:
+        curses.echo()
+        curses.nocbreak()
+        stdscr.keypad(False)
+        curses.endwin()
+    except curses.error:
+        pass
+    if cwd and os.path.isdir(cwd):
+        os.chdir(cwd)
+    print(f"\n→ claude --resume {row.sid}" + (f"   (in {cwd})" if cwd else ""), flush=True)
+    try:
+        os.execvp(claude_bin, [claude_bin, "--resume", row.sid])
+    except OSError as e:
+        # exec 失败时终端已还原，直接报错退出；为回 TUI 而重建 curses 不值当
+        print(f"启动 claude 失败: {e}", file=sys.stderr)
+        raise SystemExit(1)
+
+
+def draw_history_panel(stdscr, y: int, w: int, r: SessionRow) -> int:
+    """画选中会话的详情面板，返回下一行的 y。结构对齐 agent 视图的会话面板。"""
+    def put(text: str, pair: int = 0) -> None:
+        nonlocal y
+        try:
+            stdscr.addstr(y, 0, dtrunc(text, w - 1), attr(pair))
+        except curses.error:
+            pass
+        y += 1
+
+    put(f"  --- {r.sid[:8]}   {r.project} ---", C_TITLE)
+    if r.stats is None:
+        put("  统计加载中…", C_DIM)
+        return y
+    if r.stats.get("failed"):
+        put("  （这个会话文件解析失败）", C_WARN)
+        return y
+    tok = r.stats["tokens"]
+    put("  " + f"模型 {r.stats['model']}   消息 {r.stats['msgs']}"
+        + "   输入 " + fmt_tokens(tok["input_tokens"])
+        + "   输出 " + fmt_tokens(tok["output_tokens"]))
+    put("  缓存读 " + fmt_tokens(tok["cache_read_input_tokens"])
+        + "   缓存写 " + fmt_tokens(tok["cache_creation_input_tokens"])
+        + "   合计 " + fmt_tokens(sum(tok.values())) + " tokens", C_DIM)
+    meaningful = [d for d in r.prompts if not str(d).lstrip().startswith("/")]
+    if meaningful:
+        put("  最近提问", C_DIM)
+        for entry in meaningful[-PROMPT_ROWS:]:
+            text = next((ln.strip() for ln in str(entry).splitlines() if ln.strip()), "")
+            put(f"    {text}")
+    return y
+
+
+def history_tui(stdscr, back_to_agent: bool):
+    curses.curs_set(0)
+    init_colors()
+    # 历史列表是静态数据，不需要 agent 视图那种 2s 重采；120ms 的超时只是为了
+    # 让懒加载和状态消息的过期有机会推进。按键是即时返回的，不用等满超时。
+    stdscr.timeout(120)
+
+    rows = collect_sessions()
+    query = ""
+    typing = False          # 是否在搜索输入模式
+    pending = b""           # 收到一半的 UTF-8 多字节序列
+    sel, top = 0, 0
+    sel_sid: str | None = None
+    hsort = 0
+    show_panel = True
+    status, status_until = "", 0.0
+    view: list[SessionRow] = rows
+
+    while True:
+        # ---- 过滤 + 排序（搜索打字时要实时刷新视图）
+        keyf = {"mtime": lambda r: -r.mtime,
+                "mtime_asc": lambda r: r.mtime,
+                "size": lambda r: -r.size}[H_SORTS[hsort][0]]
+        view = sorted((r for r in rows if row_match(r, query)), key=keyf)
+        # 选择锚定在 sid 上而不是行号上：排序 / 过滤都会重排列表，
+        # 锚行号会让选择滑到不相干的行（agent 视图同理，见那里的说明）
+        if sel_sid is not None:
+            sel = next((i for i, r in enumerate(view) if r.sid == sel_sid),
+                       min(sel, max(0, len(view) - 1)))
+        sel = max(0, min(sel, max(0, len(view) - 1)))
+        sel_sid = view[sel].sid if view else None
+
+        # ---- 懒加载：选中行优先（详情面板要用），再补可见行的标题。
+        # 打字时跳过：一次 15-100ms 的文件解析会让按键明显发粘
+        h, w = stdscr.getmaxyx()
+        rows_h = max(1, h - 6 - (H_PANEL_H if show_panel and view else 0))
+        if not typing and view:
+            want = []
+            if view[sel].stats is None:
+                want.append(view[sel])
+            for r in view[top:top + rows_h]:
+                if len(want) >= H_LOAD_PER_FRAME:
+                    break
+                if r.stats is None and r is not view[sel]:
+                    want.append(r)
+            for r in want:
+                st = session_stats(r.sid, r.path)
+                if st is None:
+                    r.stats = {"failed": True}   # 解析失败也标记上，别每帧重试
+                else:
+                    r.stats = st
+                    if st.get("title") and st["title"] != r.title:
+                        r.title = st["title"]
+                        r.hay = ""               # 标题变了，搜索索引要重建
+
+        # ---- 渲染
+        stdscr.erase()
+        title = f" claude 会话历史（{len(view)}/{len(rows)}） "
+        try:
+            stdscr.addstr(0, 0, dtrunc(title, w - 1), attr(C_TITLE, curses.A_BOLD))
+            right = f"{H_SORTS[hsort][1]} "
+            if dwidth(right) < w - dwidth(title) - 2:
+                stdscr.addstr(0, w - dwidth(right) - 1, right, attr(C_DIM))
+            stdscr.addstr(1, 0, "-" * max(0, w - 1), attr(C_DIM))
+        except curses.error:
+            pass
+
+        y = 2
+        when_w, proj_w, size_w = 12, 26, 9
+        title_w = max(12, w - 2 - when_w - proj_w - size_w - 3)
+        hdr = ("  " + dpad("时间", when_w) + dpad("标题 / 最近提问", title_w)
+               + dpad("项目", proj_w) + dpad("大小", size_w, True))
+        try:
+            stdscr.addstr(y, 0, dtrunc(hdr, w - 1), attr(C_DIM)); y += 1
+            stdscr.addstr(y, 0, "  " + "-" * max(0, w - 5), attr(C_DIM)); y += 1
+        except curses.error:
+            pass
+
+        # 滚动：保证选中行可见（与 agent 详情视图同一套逻辑）
+        if sel < top:
+            top = sel
+        elif sel >= top + rows_h:
+            top = sel - rows_h + 1
+        top = max(0, min(top, max(0, len(view) - rows_h)))
+
+        for i in range(top, min(len(view), top + rows_h)):
+            when, text, proj = row_text(view[i])
+            text = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+            line = ("  " + dpad(when, when_w) + dpad(dtrunc(text, title_w), title_w)
+                    + dpad(dtrunc(proj, proj_w), proj_w)
+                    + dpad(fmt_bytes(view[i].size), size_w, True))
+            try:
+                stdscr.addstr(y, 0, dtrunc(line, w - 1),
+                              attr(C_SEL) if i == sel else 0)
+            except curses.error:
+                pass
+            y += 1
+        if not view:
+            try:
+                stdscr.addstr(y, 0, dtrunc("  （没有匹配的会话）", w - 1), attr(C_WARN))
+                y += 1
+            except curses.error:
+                pass
+
+        if show_panel and view and y < h - 3:
+            y = draw_history_panel(stdscr, y, w, view[sel])
+
+        # ---- 状态栏
+        if status and time.time() < status_until:
+            try:
+                stdscr.addstr(h - 2, 0, dtrunc(status, w - 1), attr(C_WARN))
+            except curses.error:
+                pass
+        try:
+            if typing:
+                # 用下划线当假光标：curses 里精确定位真光标麻烦，也没必要
+                stdscr.addstr(h - 1, 0, dtrunc("  / " + query + "_", w - 1), attr(C_WARN))
+            else:
+                keys = (f"  Enter 恢复会话   / 搜索   s 排序({H_SORTS[hsort][1]})"
+                        f"   t 详情   PgUp/PgDn 翻页   r 重扫"
+                        f"   {'Esc 返回' if back_to_agent else 'q 退出'}")
+                stdscr.addstr(h - 1, 0, dtrunc(keys, w - 1), attr(C_TITLE))
+        except curses.error:
+            pass
+        stdscr.refresh()
+
+        # ---- 输入
+        ch = stdscr.getch()
+        if ch == -1 or ch == curses.KEY_RESIZE:
+            continue
+
+        if typing:
+            if ch in (10, 13):                      # Enter：确认搜索，保留过滤
+                typing, pending = False, b""
+            elif ch == 27:                          # Esc：清空过滤
+                typing, pending, query = False, b"", ""
+                sel, sel_sid = 0, None
+            elif ch in (8, 127, curses.KEY_BACKSPACE):
+                if pending:
+                    pending = b""                   # 只删掉凑了一半的多字节字符
+                elif query:
+                    query = query[:-1]
+            elif 32 <= ch < 256:
+                pending += bytes([ch])
+                try:
+                    query += pending.decode("utf-8")
+                    pending = b""
+                except UnicodeDecodeError:
+                    pass                            # 中文占 3 字节，等后两个到齐
+            continue
+
+        if ch in (ord("q"), 27, curses.KEY_LEFT):
+            # Esc 在从 agent 视图进来时是「返回上一层」，直接启动时就是退出
+            if ch != ord("q") and back_to_agent:
+                return "agent"
+            return None
+        if ch == curses.KEY_UP:
+            sel -= 1
+        elif ch == curses.KEY_DOWN:
+            sel += 1
+        elif ch == curses.KEY_PPAGE:
+            sel -= rows_h
+        elif ch == curses.KEY_NPAGE:
+            sel += rows_h
+        elif ch in (curses.KEY_HOME, ord("g")):
+            sel = 0
+        elif ch in (curses.KEY_END, ord("G")):
+            sel = len(view) - 1
+        if ch in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE,
+                  curses.KEY_NPAGE, curses.KEY_HOME, curses.KEY_END,
+                  ord("g"), ord("G")):
+            # 锚点跟着移动走，否则下一帧的锚定会按移动前的 sid 把行号算回去
+            sel = max(0, min(sel, max(0, len(view) - 1)))
+            if view:
+                sel_sid = view[sel].sid
+        elif ch == ord("/"):
+            typing, pending = True, b""
+        elif ch == ord("s"):
+            hsort = (hsort + 1) % len(H_SORTS)
+        elif ch == ord("t"):
+            show_panel = not show_panel
+        elif ch == ord("r"):
+            rows = collect_sessions()
+            status, status_until = f"已重扫：{len(rows)} 个会话", time.time() + 2
+        elif ch in (10, 13, curses.KEY_RIGHT, ord("l")):
+            if view:
+                claude_bin = shutil.which("claude")
+                if not claude_bin:
+                    status = "PATH 里找不到 claude，无法恢复会话"
+                    status_until = time.time() + 3
+                else:
+                    resume_session(stdscr, view[sel], claude_bin)  # 成功则不再返回
+
+
 def main() -> int:
     args = sys.argv[1:]
+    # 子命令 history —— 浏览历史会话；其余 --xxx 旗标沿用 agent 视图的解析
+    start = "history" if args and args[0] == "history" else "agent"
+    if start == "history":
+        args = args[1:]
+
     interval = 2.0
     if "--interval" in args:
         i = args.index("--interval")
@@ -1171,19 +1610,34 @@ def main() -> int:
             print("--interval 需要数字", file=sys.stderr)
             return 2
 
-    procs = scan()
-    if "--list" in args:
-        print_list()
-        return 0
-    if "--json" in args:
-        print_json(procs)
-        return 0
-    if "--once" in args or not sys.stdout.isatty():
-        print_table(procs)
-        return 0
+    if start == "history":
+        # 与 agent 视图同一约定：管道里自动退化成一次性表格
+        if "--once" in args or not sys.stdout.isatty():
+            print_history_table(collect_sessions())
+            return 0
+    else:
+        procs = scan()
+        if "--list" in args:
+            print_list()
+            return 0
+        if "--json" in args:
+            print_json(procs)
+            return 0
+        if "--once" in args or not sys.stdout.isatty():
+            print_table(procs)
+            return 0
 
+    # 两个视图可互相跳转（agent --H--> history --Esc--> agent），每次跳转都完整
+    # 走一遍 curses 的 init/teardown，不共用屏幕状态
     try:
-        curses.wrapper(lambda s: tui(s, interval))
+        view, from_agent = start, False
+        while view:
+            if view == "agent":
+                res = curses.wrapper(lambda s: tui(s, interval))
+                view, from_agent = ("history", True) if res == "history" else (None, False)
+            else:
+                res = curses.wrapper(lambda s: history_tui(s, from_agent))
+                view = "agent" if res == "agent" else None
     except KeyboardInterrupt:
         pass
     return 0

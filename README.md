@@ -20,6 +20,7 @@ macOS 上的进程与开机自启管理小工具，两个子命令：
   - [control fl/uu on](#control-fluu-on)
   - [control agent（TUI）](#control-agenttui)
     - [会话是怎么和进程对上的](#会话是怎么和进程对上的)
+    - [control agent history（历史会话浏览）](#control-agent-history历史会话浏览)
 - [已实现的功能](#已实现的功能)
 - [harness 匹配策略](#harness-匹配策略)
 - [终端兼容性：界面为什么全是 ASCII](#终端兼容性界面为什么全是-ascii)
@@ -72,7 +73,25 @@ $ pgrep -f CorpLink                    # 毫秒级又被 launchd 拉回来
 
 不需要 pip、不需要 brew、不需要 Node。
 
-### 方式一：clone 后一键安装（推荐）
+### 方式一：一行命令安装最新版（推荐）
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/prnake/haruka-control/main/install.sh | bash
+```
+
+脚本会从 GitHub release 拉最新版本、做 SHA256 校验，然后装到 `~/.local/bin`。
+`install.sh` 身边没有 `control` 文件时自动进入这个下载模式，所以同一份脚本既能
+`curl | bash` 也能在仓库里直接跑。
+
+钉住某个版本（比如排查回归）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/prnake/haruka-control/main/install.sh | bash -s -- v1.2.3
+```
+
+装到别处：`curl … | PREFIX=/usr/local/bin bash`（或 clone 后 `PREFIX=… ./install.sh`）。
+
+### 方式二：clone 后安装（开发 / 离线）
 
 ```bash
 git clone https://github.com/prnake/haruka-control.git
@@ -80,27 +99,41 @@ cd haruka-control
 ./install.sh
 ```
 
-`install.sh` 会把两个脚本装到 `~/.local/bin`，并检查 python3 与 PATH。
+clone 装出来的是仓库当前代码（版本号 `0.0.0-dev`），适合改代码验证；
+日常使用建议用方式一 —— release 里的 `control` 带真实版本号，`control update`
+和启动检测都依赖它。
 
-装到别处：
-
-```bash
-PREFIX=/usr/local/bin ./install.sh
-```
-
-### 方式二：只下这两个文件
+### 方式三：手动下载 release 文件
 
 ```bash
 mkdir -p ~/.local/bin && cd ~/.local/bin
 
-curl -fsSLO https://raw.githubusercontent.com/prnake/haruka-control/main/control
-curl -fsSLO https://raw.githubusercontent.com/prnake/haruka-control/main/control-agent
+base=https://github.com/prnake/haruka-control/releases/latest/download
+curl -fsSLO "$base/control"
+curl -fsSLO "$base/control-agent"
+curl -fsSLO "$base/SHA256SUMS" && shasum -a 256 -c --ignore-missing SHA256SUMS
 
 chmod +x control control-agent
 ```
 
 > 注意：`control-agent` 必须和 `control` 放在**同一个目录**，
 > 因为 `control agent` 是在自己所在目录里找它的（`control` 里有路径检查，找不到会明确报错）。
+
+### 升级：control update 与启动检测
+
+```bash
+control update          # 检查并安装最新 release（--force 忽略比较强制重装）
+control version         # 查看当前版本
+```
+
+- `control update` 会把新版的 `control` / `control-agent` 下到临时目录，过
+  SHA256SUMS 校验，再原子替换（先写 `.new` 再 `mv`，不会覆盖到正在运行的半截脚本）。
+  装到哪由「正在运行的 control 在哪」决定，`PREFIX` 装到别处的用户一样能用。
+- 每次交互式启动会顺带检查新版：**每 24 小时最多联网一次**（上次失败则 1 小时后重试），
+  结果缓存在 `~/.cache/haruka-control/update-state`；已知有新版时每次启动都提示一行，
+  但不再联网。管道 / 脚本里（非 tty）不检查，不影响速度。
+- 设 `HARUKA_NO_UPDATE_CHECK=1` 彻底关闭启动检测。
+- 在仓库检出里跑 `./control update` 会被拒绝（防止覆盖源码），开发升级用 `git pull && ./install.sh`。
 
 ### 把 ~/.local/bin 加进 PATH
 
@@ -126,6 +159,7 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
 
 ```bash
 control --help          # 应打印用法
+control version         # 应打印版本（curl 安装的应不是 0.0.0-dev）
 control status          # 应打印飞连 / UURemote 状态
 control agent --list    # 应列出 14 个 harness 及其匹配规则
 ```
@@ -222,6 +256,7 @@ control agent                 # 打开 TUI
 control agent --once          # 打印一次表格后退出（非交互，可管道）
 control agent --json          # 输出 JSON
 control agent --list          # 列出识别到的 harness 及匹配规则
+control agent history         # 浏览 / 搜索所有历史的 Claude Code 会话，回车恢复
 control agent --interval 5    # 覆写刷新间隔（秒）
 ```
 
@@ -310,6 +345,7 @@ assistant 轮次，于是落盘文件根本不存在，但它们在 `history.jso
 | `k` | **杀掉**选中的目标：harness 行 = 整组，详情里的进程行 = 单个 |
 | `t` | 切换详情页的会话面板（token 用量 / 标题 / 最近提问） |
 | `s` | 切换排序：内存 → CPU → 名称 |
+| `H` | 打开历史会话浏览（见下节，`Esc` 原路返回） |
 | `r` | 立即刷新 |
 | `q` | 退出 |
 
@@ -318,6 +354,48 @@ assistant 轮次，于是落盘文件根本不存在，但它们在 `history.jso
 > 列表是按内存实时排序的，而内存每帧都在变。选中项因此**锚定在具体的进程/harness 上，
 > 而不是行号上** —— 排序变化时选择会跟着目标走，不会滑到相邻的另一行。
 > 这一点对 `k` 尤其重要：否则「选中的」和「杀掉的」可能不是同一个。
+
+### control agent history（历史会话浏览）
+
+`--once` / 详情面板看的是**正在跑**的进程，`control agent history` 看的是磁盘上的
+**全部**历史会话 —— 不管现在跑没跑，装过 Claude Code 以来的每一次对话都在。
+数据来自 `~/.claude/projects/*/*.jsonl`（事实来源，保证「一个字没敲就退出」的会话
+也不漏）+ `~/.claude/history.jsonl`（补精确项目路径、提问列表）。
+
+```
+ claude 会话历史（11/87）                                                          时间新→旧
+------------------------------------------------------------------------------------------------------------
+  时间        标题 / 最近提问                                           项目                       大小
+  ---------------------------------------------------------------------------------------------------------
+  09-22 12:19 Claude Code 历史对话查找与打开                            ~/Library/Mobile Docum   1.05 MB
+  09-22 11:35 control-agent-token-usage                                 ~/Documents              5.07 MB
+  09-16 16:27 commit & push 对应修改                                    ~/Downloads/haruka-pa    3.20 MB
+  ...
+  --- 2df1a766   /Users/pka/Library/Mobile Documents/.../haruka-control ---
+  模型 glm-5.3-highspeed   消息 82   输入 208,760   输出 122,868
+  缓存读 7,644,480   缓存写 0   合计 7,976,108 tokens
+  最近提问
+    control agent history ；需要能够查找所有历史的claude code的对话，并且用户按回车后可以自动打开
+```
+
+**打开就是秒的**：首次进入只做目录扫描（87 个会话 <10ms），标题和 token 统计按
+可见行懒加载，每帧最多解析 2 个文件（单个 15–100ms），翻页时再补新露出来的行。
+
+- **Enter 恢复会话**：在当前终端直接 `claude --resume <sessionId>`。TUI 用 `exec`
+  把自己换成 claude 进程，退出对话后看到的就是原来的 shell —— 和手敲命令的体验
+  一致，不会落回一个空壳。恢复前会先 `cd` 到该会话的项目目录（取自
+  `history.jsonl` 的原始路径；项目目录已被删时读会话文件头部的 `cwd` 记录兜底）。
+- **`/` 搜索**：关键词命中 标题 / 该会话的**全部提问** / 项目路径 / 会话 id，
+  多个词按空格分隔、AND 语义。中文输入可用 —— curses 的 `getch` 一次只吐一个
+  字节，中文要凑满 3 个 UTF-8 字节才是一个字，这里做了字节缓冲再解码。
+- `s` 切换排序（时间新→旧 / 时间旧→新 / 大小），`t` 收起详情面板，`r` 重新扫描，
+  `g` / `G` 跳首尾，PgUp / PgDn 翻页；agent TUI 里按 `H` 也能进这里，`Esc` 原路返回。
+- 管道里自动退化成一次性表格（最近 30 条），不挂终端。
+
+> 为什么不把 projects/ 的目录名解码成项目路径：Claude Code 的目录名是 cwd 里的
+> `/` 换成 `-`，这个变换**不可逆**（`com~apple~CloudDocs` 编码后是
+> `com-apple-CloudDocs`，和本来就带 `-` 的路径撞车）。`history.jsonl` 的 `project`
+> 字段存的是原始路径，所以一律优先从那里取，目录名解码只做兜底。
 
 ---
 
@@ -338,6 +416,10 @@ assistant 轮次，于是落盘文件根本不存在，但它们在 `history.jso
 - [x] 颜色输出仅在 tty 下启用，重定向到文件时自动关闭
 - [x] 操作前打印风险提示（断内网 / 断远程连接 / 合规告警）
 - [x] `--help` 直接由脚本头部的注释块生成，不会和实现脱节
+- [x] `control update` 自更新：从 GitHub release 下载 + SHA256 校验 + 原子替换（先写 `.new` 再 `mv`），装到「正在运行的 control」所在目录
+- [x] 交互式启动自动检查新版：每 24h 联网一次（失败 1h 后重试），已知新版每次提示但不重复联网；非 tty 不检查；`HARUKA_NO_UPDATE_CHECK=1` 可关
+- [x] `curl -fsSL … | bash` 一行安装：install.sh 自动识别本地 / 下载模式，支持钉版本、SHA256 校验
+- [x] GitHub Actions：push tag `v*.*.*` 自动打版本号、自检、发布 release（含 SHA256SUMS）；PR / push 有 macOS 语法冒烟
 
 ### `control-agent`（harness 占用 TUI）
 
@@ -348,6 +430,9 @@ assistant 轮次，于是落盘文件根本不存在，但它们在 `history.jso
 - [x] 文件夹式的两层界面：harness 列表 → 单个进程详情（pid / 内存 / CPU / 运行时长 / 受保护 / **工作目录**）
 - [x] 详情页显示每个进程的**工作目录**（`lsof` 按需查询 + 缓存），同名的多个 `claude` 靠它区分
 - [x] 详情页显示选中进程的**会话面板**：token 用量（输入/输出/缓存读/缓存写）、会话标题、最近 3 条提问
+- [x] `control agent history` / `H` 键：浏览并搜索**所有历史** Claude Code 会话，Enter 在当前终端 `claude --resume` 恢复
+- [x] 历史搜索命中 标题/全部提问/项目路径/会话 id，多词 AND，中文可用（curses 字节流缓冲拼 UTF-8）
+- [x] 历史列表懒加载：进入只做目录扫描（<10ms），标题/token 按可见行逐帧补齐
 - [x] 进程 → 会话的对应靠「`etime` 反推启动时间 vs 会话首次活动时间」，而不是「目录下最近活动的会话」（后者在同目录多会话时会把 token 数翻倍）
 - [x] 对应关系区分 `确认` / `推测`，推测时显示偏差秒数；`--resume` 复用的旧会话不会冒充确定结果
 - [x] 只有斜杠命令（`/resume`、`/model`）的空壳会话会被跳过，不会被 `--resume` 启动的进程认领

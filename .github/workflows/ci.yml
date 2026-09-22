@@ -1,0 +1,26 @@
+# 每次 push / PR 的轻量自检：语法 + 冒烟。
+# 跑在 macOS 上是因为真实运行环境就是 macOS 的 bash 3.2 / 系统 python3，
+# 在新版 bash 或 Linux 上语法通过不代表能跑。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax
+        run: |
+          bash -n control
+          bash -n install.sh
+          python3 -m py_compile control-agent
+      - name: Smoke
+        run: |
+          ./control version
+          HARUKA_NO_UPDATE_CHECK=1 ./control agent --list >/dev/null
+          ./control agent history --once | head -3
+          ./control agent --json | python3 -c 'import json,sys; json.load(sys.stdin)'

@@ -1,0 +1,37 @@
+# 打 tag（v*.*.*）时发布 release：
+#   1. 把 tag 名写进 control 的 VERSION（仓库里恒为 0.0.0-dev，只有 release 资产带真实版本）
+#   2. 语法自检，防止把坏脚本发布出去
+#   3. 生成 SHA256SUMS，连同两个脚本作为 release 资产上传
+#   curl | bash 和 control update 都从这些资产下载。
+name: release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stamp version & verify
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          sed -i "s/^VERSION=\".*\"/VERSION=\"${TAG}\"/" control
+          grep -q "VERSION=\"${TAG}\"" control || { echo "VERSION 注入失败"; exit 1; }
+          bash -n control
+          python3 -m py_compile control-agent
+          sha256sum control control-agent > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            control
+            control-agent
+            SHA256SUMS
+          generate_release_notes: true
